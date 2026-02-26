@@ -1269,16 +1269,15 @@ class StatLoggerManager:
         if enable_default_loggers and logger.isEnabledFor(logging.INFO):
             if client_count > 1:
                 logger.warning(
-                    "AsyncLLM created with api_server_count more than 1; "
-                    "disabling stats logging to avoid incomplete stats."
+                    "[AntGroup] AsyncLLM created with api_server_count more than 1; "
+                    "enabling stats logging with incomplete stats."
                 )
-            else:
-                default_logger_factory = (
-                    AggregatedLoggingStatLogger
-                    if aggregate_engine_logging
-                    else LoggingStatLogger
-                )
-                stat_logger_factories.append(default_logger_factory)
+            default_logger_factory = (
+                AggregatedLoggingStatLogger
+                if aggregate_engine_logging
+                else LoggingStatLogger
+            )
+            stat_logger_factories.append(default_logger_factory)
         custom_prometheus_logger: bool = False
         for stat_logger_factory in stat_logger_factories:
             if isinstance(stat_logger_factory, type) and issubclass(
