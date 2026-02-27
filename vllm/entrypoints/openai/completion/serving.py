@@ -139,6 +139,24 @@ class OpenAIServingCompletion(OpenAIServing):
 
         lora_request = self._maybe_get_adapters(request)
 
+        if len(engine_prompts) > 1:
+            raise NotImplementedError(
+                "Batching of multiple prompts is not supported for "
+                "completion requests. Please use a single prompt.")
+        try:
+            kv_transfer_params = request.kv_transfer_params
+            if kv_transfer_params is not None and \
+                kv_transfer_params.get("do_remote_prefill", False):
+                last_token_id = kv_transfer_params.get("last_token_id", None)
+                if last_token_id is None:
+                    raise ValueError(
+                        "In disaggregated prefill mode, "
+                        "kv_transfer_params must contain the 'last_token_id' key, "
+                        f"but received: {kv_transfer_params}")
+                engine_prompts[0]["prompt_token_ids"] += [last_token_id]
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
