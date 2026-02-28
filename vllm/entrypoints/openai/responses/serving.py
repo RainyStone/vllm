@@ -171,6 +171,7 @@ class OpenAIServingResponses(OpenAIServing):
         chat_template_content_format: ChatTemplateContentFormatOption,
         return_tokens_as_token_ids: bool = False,
         reasoning_parser: str = "",
+        reasoning_padding: str = "",
         enable_auto_tools: bool = False,
         tool_parser: str | None = None,
         tool_server: ToolServer | None = None,
@@ -197,6 +198,7 @@ class OpenAIServingResponses(OpenAIServing):
             enable_auto_tools=enable_auto_tools,
             model_name=self.model_config.model,
         )
+        self.reasoning_padding = reasoning_padding
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
 

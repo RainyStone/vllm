@@ -97,6 +97,7 @@ class OpenAIServingChat(OpenAIServing):
         trust_request_chat_template: bool = False,
         return_tokens_as_token_ids: bool = False,
         reasoning_parser: str = "",
+        reasoning_padding: str | None = None,
         enable_auto_tools: bool = False,
         exclude_tools_when_tool_choice_none: bool = False,
         tool_parser: str | None = None,
@@ -126,6 +127,7 @@ class OpenAIServingChat(OpenAIServing):
         self.reasoning_parser_cls = ParserManager.get_reasoning_parser(
             reasoning_parser_name=reasoning_parser
         )
+        self.reasoning_padding = reasoning_padding
         # set up tool use
         self.enable_auto_tools: bool = enable_auto_tools
         self.tool_parser = ParserManager.get_tool_parser(
@@ -600,6 +602,10 @@ class OpenAIServingChat(OpenAIServing):
                     # Send first response for each request.n (index) with
                     # the role
                     role = self.get_chat_request_role(request)
+                    first_chunk_content = ""
+                    if need_thinking_padding :
+                        first_chunk_padding = self.reasoning_padding
+                        first_chunk_content = f"{first_chunk_padding}\n" if first_chunk_padding else ""
 
                     # NOTE num_choices defaults to 1 so this usually executes
                     # once per request
@@ -608,7 +614,7 @@ class OpenAIServingChat(OpenAIServing):
                             index=i,
                             delta=DeltaMessage(
                                 role=role,
-                                content="",
+                                content=first_chunk_content,
                             ),
                             logprobs=None,
                             finish_reason=None,
@@ -1311,6 +1317,8 @@ class OpenAIServingChat(OpenAIServing):
             token_ids = output.token_ids
             out_logprobs = output.logprobs
             tool_call_info = None
+            if self.reasoning_padding and output.text is not None:
+                output.text = f"{self.reasoning_padding}\n{output.text}"
 
             if request.logprobs and request.top_logprobs is not None:
                 assert out_logprobs is not None, "Did not output logprobs"

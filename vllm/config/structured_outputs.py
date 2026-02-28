@@ -40,6 +40,8 @@ class StructuredOutputsConfig:
     loaded and registered."""
     enable_in_reasoning: bool = False
     """Whether to use structured input for reasoning."""
+    reasoning_padding: str | None = None
+    """Output padding token for reasoning models before generation, e.g. '<think>\n'"""
 
     def compute_hash(self) -> str:
         """

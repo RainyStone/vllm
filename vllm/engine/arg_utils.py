@@ -527,6 +527,7 @@ class EngineArgs:
     )
     reasoning_parser: str = StructuredOutputsConfig.reasoning_parser
     reasoning_parser_plugin: str | None = None
+    reasoning_padding: str | None = StructuredOutputsConfig.reasoning_padding
 
     speculative_config: dict[str, Any] | None = None
 
@@ -796,6 +797,10 @@ class EngineArgs:
         structured_outputs_group.add_argument(
             "--reasoning-parser-plugin",
             **structured_outputs_kwargs["reasoning_parser_plugin"],
+        )
+        structured_outputs_group.add_argument(
+            "--reasoning-padding",
+            **structured_outputs_kwargs["reasoning_padding"],
         )
 
         # Parallel arguments
@@ -1865,6 +1870,8 @@ class EngineArgs:
         # Pass reasoning_parser into StructuredOutputsConfig
         if self.reasoning_parser:
             self.structured_outputs_config.reasoning_parser = self.reasoning_parser
+        if self.reasoning_padding:
+            self.structured_outputs_config.reasoning_padding = self.reasoning_padding
 
         if self.reasoning_parser_plugin:
             self.structured_outputs_config.reasoning_parser_plugin = (
