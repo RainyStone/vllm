@@ -184,9 +184,11 @@ class EngineCore:
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
+        self.post_step_batch_queue = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+            self.post_step_batch_queue = deque(maxlen=self.batch_queue_size)
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -208,6 +210,8 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        self.post_step_fn = (self.post_step if self.post_step_batch_queue is None else
+                             self.post_step_with_batch_queue)
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -406,7 +410,7 @@ class EngineCore:
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
-    def post_step(self, model_executed: bool) -> None:
+    def post_step(self, model_executed: bool, outputs) -> None:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
@@ -415,6 +419,17 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    def post_step_with_batch_queue(self, model_executed: bool, outputs) -> None:
+        if self.use_spec_decode and model_executed:
+            # Take the draft token ids.
+            draft_token_ids = self.model_executor.take_draft_token_ids(non_block=True)
+            self.post_step_batch_queue.appendleft(draft_token_ids)
+
+            if outputs is not None:
+                draft_token_ids = self.post_step_batch_queue.pop().result()
+                if draft_token_ids is not None:
+                    self.scheduler.update_draft_token_ids(draft_token_ids)
 
     def step_with_batch_queue(
         self,
@@ -1174,7 +1189,7 @@ class EngineCoreProc(EngineCore):
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
         # Post-step hook.
-        self.post_step(model_executed)
+        self.post_step_fn(model_executed, outputs)
 
         # If no model execution happened but there are waiting requests
         # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
