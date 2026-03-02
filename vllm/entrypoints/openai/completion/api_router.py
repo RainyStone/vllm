@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.entrypoints.utils import track_request_exit
 
 from http import HTTPStatus
 
@@ -43,6 +44,7 @@ def completion(request: Request) -> OpenAIServingCompletion | None:
 )
 @with_cancellation
 @load_aware_call
+@track_request_exit
 async def create_completion(request: CompletionRequest, raw_request: Request):
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""

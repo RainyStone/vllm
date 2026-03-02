@@ -1052,6 +1052,11 @@ class OpenAIServing:
             priority = orig_priority - 1
             sub_request += 1
 
+    def _log_arrival(self, request_id: str) -> None:
+        if self.request_logger is None:
+            return
+        self.request_logger.log_arrival(request_id)
+
     def _log_inputs(
         self,
         request_id: str,
