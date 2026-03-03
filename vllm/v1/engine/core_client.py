@@ -51,6 +51,7 @@ from vllm.v1.engine.utils import (
     get_engine_zmq_addresses,
     launch_core_engines,
 )
+from vllm.v1.engine.util_remapper import RequestEngineMapper
 from vllm.v1.executor import Executor
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
@@ -1355,7 +1356,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # To route aborts to the correct engine.
         self.reqs_in_flight: dict[str, EngineIdentity] = {}
-
+        self.re_mapper = RequestEngineMapper(ttl_minutes=60, cleanup_interval=60)
         super().__init__(
             vllm_config,
             executor_class,
@@ -1370,6 +1371,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+        try:
+            asyncio.create_task(self.re_mapper.start_cleanup_task())
+            logger.info("RequestEngineMapper Cleanup task created")
+        except RuntimeError as e:
+            if "no running event loop" in str(e):
+                logger.warning("Cannot start RequestEngineMapper cleanup task: no running event loop. "
+                            "Please ensure this class is initialized within an async context.")
+            else:
+                raise
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -1399,6 +1409,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
+        self.re_mapper.add_mapping(request.request_id, chosen_engine)
         return chosen_engine
 
     async def call_utility_async(self, method: str, *args) -> Any:
@@ -1489,14 +1500,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # Fast-path common case.
             if engine := self.reqs_in_flight.get(request_ids[0]):
                 await self._abort_requests(request_ids, engine)
+                self.re_mapper.remove_mapping(request_ids[0])
+            elif engine := self.re_mapper.get_engine(request_ids[0]):
+                await self._abort_requests(request_ids, engine)
+                self.re_mapper.remove_mapping(request_ids[0])
             return
 
         by_engine = defaultdict[EngineIdentity, list[str]](list)
         for req_id in request_ids:
             if engine := self.reqs_in_flight.get(req_id):
                 by_engine[engine].append(req_id)
+            elif engine := self.re_mapper.get_engine(req_id):
+                by_engine[engine].append(req_id)
         for engine, req_ids in by_engine.items():
             await self._abort_requests(req_ids, engine)
+            for req_id in req_ids:
+                self.re_mapper.remove_mapping(req_id)
 
     async def _abort_requests(
         self, request_ids: list[str], engine: EngineIdentity
