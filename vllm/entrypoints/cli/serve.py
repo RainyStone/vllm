@@ -294,6 +294,7 @@ def run_multi_api_server(args: argparse.Namespace):
             stats_update_address=coordinator.get_stats_publish_address()
             if coordinator
             else None,
+            enable_graceful_shutdown=not args.disable_graceful_shutdown,
         )
 
     # Pass updated vllm_config into api_server args

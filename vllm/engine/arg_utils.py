@@ -2225,6 +2225,7 @@ class AsyncEngineArgs(EngineArgs):
     """Arguments for asynchronous vLLM engine."""
 
     enable_log_requests: bool = False
+    disable_graceful_shutdown: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -2244,6 +2245,12 @@ class AsyncEngineArgs(EngineArgs):
             "- INFO: Request ID, parameters and LoRA request.\n"
             "- DEBUG: Prompt inputs (e.g: text, token IDs).\n"
             "You can set the minimum log level via `VLLM_LOGGING_LEVEL`.",
+        )
+        parser.add_argument(
+            "--disable-graceful-shutdown",
+            action=argparse.BooleanOptionalAction,
+            default=AsyncEngineArgs.disable_graceful_shutdown,
+            help="Disable graceful shutdown.",
         )
         current_platform.pre_register_and_update(parser)
         return parser

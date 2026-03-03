@@ -175,6 +175,7 @@ class APIServerProcessManager:
         input_addresses: list[str],
         output_addresses: list[str],
         stats_update_address: str | None = None,
+        enable_graceful_shutdown: bool = False,
     ):
         """Initialize and start API server worker processes.
 
@@ -191,6 +192,7 @@ class APIServerProcessManager:
         self.listen_address = listen_address
         self.sock = sock
         self.args = args
+        self.enable_graceful_shutdown = enable_graceful_shutdown
 
         # Start API servers
         spawn_context = multiprocessing.get_context("spawn")
@@ -221,12 +223,21 @@ class APIServerProcessManager:
 
         # Shutdown only the API server processes on garbage collection
         # The extra processes are managed by their owners
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        finalizer_timeout = None if enable_graceful_shutdown else 5
+        self._finalizer = weakref.finalize(
+            self,
+            shutdown,
+            self.processes,
+            finalizer_timeout,
+        )
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown API server processes with configurable timeout"""
         if self._finalizer.detach() is not None:
-            shutdown(self.processes, timeout=timeout)
+            if self.enable_graceful_shutdown and timeout is None:
+                shutdown(self.processes, timeout=None)
+            else:
+                shutdown(self.processes, timeout=timeout)
 
 
 def wait_for_completion_or_failure(
@@ -304,23 +315,23 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
         procs: List of processes to shutdown
         timeout: Maximum time in seconds to wait for graceful shutdown
     """
-    if timeout is None:
-        timeout = 0.0
-
-    # Allow at least 5 seconds for remaining procs to terminate.
-    timeout = max(timeout, 5.0)
-
     # Shutdown the process.
     for proc in procs:
         if proc.is_alive():
             proc.terminate()
 
-    # Allow time for remaining procs to terminate.
-    deadline = time.monotonic() + timeout
+    # Allow time for remaining procs to terminate. When timeout is None,
+    # wait indefinitely for graceful shutdown.
+    if timeout is not None:
+        timeout = max(timeout, 5.0)
+        deadline = time.monotonic() + timeout
     for proc in procs:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
+        if timeout is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+        else:
+            remaining = None
         if proc.is_alive():
             proc.join(remaining)
 

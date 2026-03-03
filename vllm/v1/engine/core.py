@@ -782,6 +782,10 @@ class EngineCore:
     ):
         raise NotImplementedError
 
+    def has_work(self) -> bool:
+        """Returns true if the engine has work to do"""
+        return self.scheduler.has_requests() or bool(self.batch_queue)
+
 
 class EngineShutdownState(IntEnum):
     RUNNING = 0

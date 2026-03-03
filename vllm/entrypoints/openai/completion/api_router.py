@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from fastapi import HTTPException
 from vllm.entrypoints.utils import track_request_exit
+from vllm.v1.engine.exceptions import EngineGracefulShutdownError
 
 from http import HTTPStatus
 
@@ -40,6 +42,7 @@ def completion(request: Request) -> OpenAIServingCompletion | None:
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
     },
 )
 @with_cancellation
@@ -53,7 +56,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if handler is None:
         raise NotImplementedError("The model does not support Completions API")
 
-    generator = await handler.create_completion(request, raw_request)
+    try:
+        generator = await handler.create_completion(request, raw_request)
+    except EngineGracefulShutdownError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail=str(e)
+        ) from e
+    except Exception as e:
+        generator = handler.create_error_response(e)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(

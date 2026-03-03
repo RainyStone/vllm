@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import signal
+from vllm.v1.engine.exceptions import EngineGracefulShutdownError
+
 import asyncio
 import os
 import socket
@@ -121,6 +125,7 @@ class AsyncLLM(EngineClient):
             init_tracer("vllm.llm_engine", tracing_endpoint)
 
         self.log_requests = log_requests
+        self.graceful_shutdown_triggered = False
 
         custom_stat_loggers = list(stat_loggers or [])
         custom_stat_loggers.extend(load_stat_logger_plugin_factories())
@@ -301,6 +306,58 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+    async def graceful_shutdown(self):
+        if self.graceful_shutdown_triggered:
+            logger.warning("AsyncLM has been shutdown gracefully")
+            return
+
+        logger.info(f"Starting to shutdown AsyncLLM gracefully")
+
+        self.graceful_shutdown_triggered = True
+
+        loop = asyncio.get_running_loop()
+        wait_task = loop.create_task(self.wait_for_all_work_done())
+
+        # Cancel graceful shutdown task at most once
+        task_cancelled = False
+
+        async def cancel_graceful_shutdown():
+            nonlocal task_cancelled
+            if task_cancelled:
+                return
+            task_cancelled = True
+            await self.abort_all_requests()
+            await self.wait_for_all_work_done()
+            cancel_task_threadsafe(wait_task)
+
+        for sig in [signal.SIGINT, signal.SIGTERM]:
+            loop.add_signal_handler(
+                sig, lambda: loop.create_task(cancel_graceful_shutdown())
+            )
+
+        try:
+            # Wait for all requests finished
+            await wait_task
+            logger.info("Graceful shutdown of AsyncLLM completed.")
+        except asyncio.CancelledError:
+            logger.warning("Graceful shutdown of AsyncLLM was cancelled by SIGINT or SIGTERM")
+        except Exception:
+            logger.exception(f"Unknown exception during graceful shutdown of AsyncLLM")
+        finally:
+            for sig in [signal.SIGINT, signal.SIGTERM]:
+                loop.remove_signal_handler(sig)
+            # After aborting all requests, wait 1s for EngineCore to handle pending tasks.
+            await asyncio.sleep(1)
+
+    async def wait_for_all_work_done(self):
+        while await self.engine_core.has_work_async():
+            await asyncio.sleep(1)
+
+    async def abort_all_requests(self):
+        request_ids = list(self.output_processor.request_states.keys())
+        if request_ids:
+            await self.abort(request_ids)
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
@@ -597,6 +654,9 @@ class AsyncLLM(EngineClient):
 
         q: RequestOutputCollector | None = None
         try:
+            if self.graceful_shutdown_triggered:
+                raise EngineGracefulShutdownError()
+
             q = await self.add_request(
                 request_id,
                 prompt,
@@ -640,6 +700,11 @@ class AsyncLLM(EngineClient):
         except EngineDeadError:
             if self.log_requests:
                 logger.info("Request %s failed (engine dead).", request_id)
+            raise
+
+        except EngineGracefulShutdownError:
+            if self.log_requests:
+                logger.error("Rejected request %s during graceful shutdown.", request_id)
             raise
 
         # Request validation error.
@@ -839,6 +904,9 @@ class AsyncLLM(EngineClient):
 
         q: RequestOutputCollector | None = None
         try:
+            if self.graceful_shutdown_triggered:
+                raise EngineGracefulShutdownError()
+
             q = await self.add_request(
                 request_id,
                 prompt,
@@ -878,6 +946,11 @@ class AsyncLLM(EngineClient):
                 logger.info("Request %s failed (engine dead).", request_id)
             raise
 
+        except EngineGracefulShutdownError:
+            if self.log_requests:
+                logger.error(f"Rejected request {request_id}")
+            raise
+
         # Request validation error.
         except ValueError:
             if self.log_requests:
@@ -913,6 +986,8 @@ class AsyncLLM(EngineClient):
         logger.debug("Called check_health.")
         if self.errored:
             raise self.dead_error
+        if self.graceful_shutdown_triggered:
+            raise EngineGracefulShutdownError()
 
     async def start_profile(self, profile_prefix: str | None = None) -> None:
         coros = [self.engine_core.profile_async(True, profile_prefix)]

@@ -674,6 +674,8 @@ async def run_server_worker(
         shutdown_task = await build_and_serve(
             engine_client, listen_address, sock, args, **uvicorn_kwargs
         )
+        if not args.disable_graceful_shutdown:
+            await engine_client.graceful_shutdown()
     # NB: Await server shutdown only after the backend context is exited
     try:
         await shutdown_task

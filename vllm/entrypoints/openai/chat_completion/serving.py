@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from http import HTTPStatus
 from vllm.entrypoints.openai.engine.protocol import FinishedStatsMetadata
+from vllm.v1.engine.exceptions import EngineGracefulShutdownError
 
 import asyncio
 import json
@@ -1340,6 +1342,11 @@ class OpenAIServingChat(OpenAIServing):
 
         except GenerationError as e:
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
+        except EngineGracefulShutdownError as e:
+            data = self.create_streaming_error_response(
+                str(e), "ServiceUnavailableError", HTTPStatus.SERVICE_UNAVAILABLE
+            )
+            yield f"data: {data}\n\n"
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)

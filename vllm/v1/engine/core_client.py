@@ -269,6 +269,9 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    async def has_work_async(self) -> bool:
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -1158,6 +1161,9 @@ class AsyncMPClient(MPClient):
             "collective_rpc", method, timeout, args, kwargs
         )
 
+    async def has_work_async(self) -> bool:
+        return await self.call_utility_async("has_work")
+
 
 class DPAsyncMPClient(AsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
@@ -1715,4 +1721,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         logger.info(
             "[Elastic EP] Scale down completed, new data parallel size: %s",
             new_data_parallel_size,
+        )
+
+    async def has_work_async(self) -> bool:
+        # Check all engines concurrently, return True if any has work remaining.
+        return any(
+            await asyncio.gather(
+                *[
+                    self._call_utility_async("has_work", engine=engine)
+                    for engine in self.core_engines
+                ]
+            )
         )

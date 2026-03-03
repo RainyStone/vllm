@@ -16,3 +16,15 @@ class EngineDeadError(Exception):
         # Make stack trace clearer when using with LLMEngine by
         # silencing irrelevant ZMQError.
         self.__suppress_context__ = suppress_context
+
+
+class EngineGracefulShutdownError(Exception):
+    """Raised when the EngineCore shutdown gracefully. Unrecoverable."""
+
+    def __init__(self, *args, suppress_context: bool = False, **kwargs):
+        ENGINE_GRACEFUL_SHUTDOWN_MESSAGE = "EngineCore shutdown gracefully; will exit after unfinished requests. Service unavailable."  # noqa: E501
+
+        super().__init__(ENGINE_GRACEFUL_SHUTDOWN_MESSAGE, *args, **kwargs)
+        # Make stack trace clearer when using with LLMEngine by
+        # silencing irrelevant ZMQError.
+        self.__suppress_context__ = suppress_context

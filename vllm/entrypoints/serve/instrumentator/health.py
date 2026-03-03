@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.v1.engine.exceptions import EngineGracefulShutdownError
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
@@ -29,5 +30,5 @@ async def health(raw_request: Request) -> Response:
     try:
         await client.check_health()
         return Response(status_code=200)
-    except EngineDeadError:
+    except (EngineDeadError, EngineGracefulShutdownError):
         return Response(status_code=503)
