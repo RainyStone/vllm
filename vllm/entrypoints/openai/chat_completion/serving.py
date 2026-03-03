@@ -208,7 +208,11 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        return await self.openai_serving_render.render_chat(request)
+        try:
+            return await self.openai_serving_render.render_chat(request)
+        except Exception as e:
+            logger.exception("Error in preprocessing prompt inputs")
+            return self.create_error_response(e)
 
     async def create_chat_completion(
         self,

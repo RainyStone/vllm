@@ -179,11 +179,14 @@ class MediaConnector:
             self._assert_url_in_allowed_media_domains(url_spec)
 
             connection = self.connection
-            data = connection.get_bytes(
-                url_spec.url,
-                timeout=fetch_timeout,
-                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
-            )
+            try:
+                data = connection.get_bytes(
+                    url_spec.url,
+                    timeout=fetch_timeout,
+                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                )
+            except TimeoutError:
+                raise ValueError(f"Timeout while accessing resource '{url}'")
 
             return media_io.load_bytes(data)
 
@@ -210,11 +213,14 @@ class MediaConnector:
             self._assert_url_in_allowed_media_domains(url_spec)
 
             connection = self.connection
-            data = await connection.async_get_bytes(
-                url_spec.url,
-                timeout=fetch_timeout,
-                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
-            )
+            try:
+                data = await connection.async_get_bytes(
+                    url_spec.url,
+                    timeout=fetch_timeout,
+                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                )
+            except TimeoutError:
+                raise ValueError(f"Timeout while accessing resource '{url}'")
             future = loop.run_in_executor(global_thread_pool, media_io.load_bytes, data)
             return await future
 
