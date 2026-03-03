@@ -282,13 +282,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="Additional kwargs for structured outputs",
     )
     priority: int = Field(
-        default=0,
+        default=3,
         ge=_INT64_MIN,
         le=_INT64_MAX,
         description=(
             "The priority of the request (lower means earlier handling; "
-            "default: 0). Any priority other than 0 will raise an error "
-            "if the served model does not use priority scheduling."
+            "default: 3)."
         ),
     )
     request_id: str = Field(
