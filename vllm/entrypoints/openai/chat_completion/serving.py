@@ -267,76 +267,85 @@ class OpenAIServingChat(OpenAIServing):
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
-        for i, engine_prompt in enumerate(engine_prompts):
-            prompt_token_ids = self._extract_prompt_components(engine_prompt).token_ids
+        try:
+            for i, engine_prompt in enumerate(engine_prompts):
+                prompt_token_ids = self._extract_prompt_components(
+                    engine_prompt
+                ).token_ids
 
-            # If we are creating sub requests for multiple prompts, ensure that they
-            # have unique request ids.
-            sub_request_id = (
-                request_id if len(engine_prompts) == 1 else f"{request_id}_{i}"
-            )
-
-            max_tokens = get_max_tokens(
-                max_model_len,
-                request.max_completion_tokens
-                if request.max_completion_tokens is not None
-                else request.max_tokens,
-                self._extract_prompt_len(engine_prompt),
-                self.default_sampling_params,
-                self.override_max_tokens,
-            )
-
-            sampling_params: SamplingParams | BeamSearchParams
-            if request.use_beam_search:
-                sampling_params = request.to_beam_search_params(
-                    max_tokens, self.default_sampling_params
+                # If we are creating sub requests for multiple prompts, ensure
+                # that they have unique request ids.
+                sub_request_id = (
+                    request_id if len(engine_prompts) == 1 else f"{request_id}_{i}"
                 )
-            else:
-                sampling_params = request.to_sampling_params(
-                    max_tokens,
+
+                max_tokens = get_max_tokens(
+                    max_model_len,
+                    request.max_completion_tokens
+                    if request.max_completion_tokens is not None
+                    else request.max_tokens,
+                    self._extract_prompt_len(engine_prompt),
                     self.default_sampling_params,
+                    self.override_max_tokens,
+                    request_id=request_id,
+                    vllm_config=(
+                        raw_request.app.state.vllm_config if raw_request else None
+                    ),
                 )
 
-            self._log_inputs(
-                sub_request_id,
-                engine_prompt,
-                params=sampling_params,
-                lora_request=lora_request,
-            )
+                sampling_params: SamplingParams | BeamSearchParams
+                if request.use_beam_search:
+                    sampling_params = request.to_beam_search_params(
+                        max_tokens, self.default_sampling_params
+                    )
+                else:
+                    sampling_params = request.to_sampling_params(
+                        max_tokens,
+                        self.default_sampling_params,
+                    )
 
-            trace_headers = (
-                None
-                if raw_request is None
-                else await self._get_trace_headers(raw_request.headers)
-            )
-
-            if isinstance(sampling_params, BeamSearchParams):
-                generator = self.beam_search(
-                    prompt=engine_prompt,
-                    request_id=sub_request_id,
+                self._log_inputs(
+                    sub_request_id,
+                    engine_prompt,
                     params=sampling_params,
                     lora_request=lora_request,
-                    trace_headers=trace_headers,
-                )
-            else:
-                reasoning_ended = (
-                    reasoning_parser.is_reasoning_end(prompt_token_ids or [])
-                    if reasoning_parser
-                    else None
                 )
 
-                generator = self.engine_client.generate(
-                    engine_prompt,
-                    sampling_params,
-                    sub_request_id,
-                    lora_request=lora_request,
-                    trace_headers=trace_headers,
-                    priority=request.priority,
-                    data_parallel_rank=data_parallel_rank,
-                    reasoning_ended=reasoning_ended,
+                trace_headers = (
+                    None
+                    if raw_request is None
+                    else await self._get_trace_headers(raw_request.headers)
                 )
 
-            generators.append(generator)
+                if isinstance(sampling_params, BeamSearchParams):
+                    generator = self.beam_search(
+                        prompt=engine_prompt,
+                        request_id=sub_request_id,
+                        params=sampling_params,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                    )
+                else:
+                    reasoning_ended = (
+                        reasoning_parser.is_reasoning_end(prompt_token_ids or [])
+                        if reasoning_parser
+                        else None
+                    )
+
+                    generator = self.engine_client.generate(
+                        engine_prompt,
+                        sampling_params,
+                        sub_request_id,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
+                        reasoning_ended=reasoning_ended,
+                    )
+
+                generators.append(generator)
+        except ValueError as e:
+            return self.create_error_response(e)
 
         assert len(generators) == 1
         (result_generator,) = generators

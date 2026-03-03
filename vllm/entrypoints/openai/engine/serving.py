@@ -755,13 +755,6 @@ class OpenAIServing:
         ):
             return TokensPrompt(prompt=input_text, prompt_token_ids=input_ids)
 
-        # chat completion endpoint supports max_completion_tokens
-        if isinstance(request, ChatCompletionRequest):
-            # TODO(#9845): remove max_tokens when field dropped from OpenAI API
-            max_tokens = request.max_completion_tokens or request.max_tokens
-        else:
-            max_tokens = getattr(request, "max_tokens", None)
-
         # Note: input length can be up to model context length - 1 for
         # completion-like requests.
         if token_num >= max_model_len:
@@ -772,21 +765,6 @@ class OpenAIServing:
                 "the input messages.",
                 parameter="input_tokens",
                 value=token_num,
-            )
-
-        if max_tokens is not None and token_num + max_tokens > max_model_len:
-            raise VLLMValidationError(
-                f"This model's maximum context length is "
-                f"{max_model_len} tokens. However, you requested "
-                f"{max_tokens} output tokens and your prompt contains "
-                f"{token_num} input tokens, for a total of "
-                f"{token_num + max_tokens} tokens "
-                f"({token_num} + {max_tokens} = "
-                f"{token_num + max_tokens} > {max_model_len}). "
-                f"Please reduce the length of the input prompt or the "
-                f"number of requested output tokens.",
-                parameter="max_tokens",
-                value=max_tokens,
             )
 
         return TokensPrompt(prompt=input_text, prompt_token_ids=input_ids)

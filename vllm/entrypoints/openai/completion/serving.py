@@ -169,61 +169,68 @@ class OpenAIServingCompletion(OpenAIServing):
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
-        for i, engine_prompt in enumerate(engine_prompts):
-            max_tokens = get_max_tokens(
-                max_model_len,
-                request.max_tokens,
-                self._extract_prompt_len(engine_prompt),
-                self.default_sampling_params,
-                self.override_max_tokens,
-            )
-
-            sampling_params: SamplingParams | BeamSearchParams
-            if request.use_beam_search:
-                sampling_params = request.to_beam_search_params(
-                    max_tokens, self.default_sampling_params
-                )
-            else:
-                sampling_params = request.to_sampling_params(
-                    max_tokens,
+        try:
+            for i, engine_prompt in enumerate(engine_prompts):
+                max_tokens = get_max_tokens(
+                    max_model_len,
+                    request.max_tokens,
+                    self._extract_prompt_len(engine_prompt),
                     self.default_sampling_params,
+                    self.override_max_tokens,
+                    request_id=request_id,
+                    vllm_config=(
+                        raw_request.app.state.vllm_config if raw_request else None
+                    ),
                 )
 
-            request_id_item = f"{request_id}-{i}"
+                sampling_params: SamplingParams | BeamSearchParams
+                if request.use_beam_search:
+                    sampling_params = request.to_beam_search_params(
+                        max_tokens, self.default_sampling_params
+                    )
+                else:
+                    sampling_params = request.to_sampling_params(
+                        max_tokens,
+                        self.default_sampling_params,
+                    )
 
-            self._log_inputs(
-                request_id_item,
-                engine_prompt,
-                params=sampling_params,
-                lora_request=lora_request,
-            )
+                request_id_item = f"{request_id}-{i}"
 
-            trace_headers = (
-                None
-                if raw_request is None
-                else await self._get_trace_headers(raw_request.headers)
-            )
-
-            if isinstance(sampling_params, BeamSearchParams):
-                generator = self.beam_search(
-                    prompt=engine_prompt,
-                    request_id=request_id,
+                self._log_inputs(
+                    request_id_item,
+                    engine_prompt,
                     params=sampling_params,
                     lora_request=lora_request,
-                    trace_headers=trace_headers,
-                )
-            else:
-                generator = self.engine_client.generate(
-                    engine_prompt,
-                    sampling_params,
-                    request_id_item,
-                    lora_request=lora_request,
-                    trace_headers=trace_headers,
-                    priority=request.priority,
-                    data_parallel_rank=data_parallel_rank,
                 )
 
-            generators.append(generator)
+                trace_headers = (
+                    None
+                    if raw_request is None
+                    else await self._get_trace_headers(raw_request.headers)
+                )
+
+                if isinstance(sampling_params, BeamSearchParams):
+                    generator = self.beam_search(
+                        prompt=engine_prompt,
+                        request_id=request_id,
+                        params=sampling_params,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                    )
+                else:
+                    generator = self.engine_client.generate(
+                        engine_prompt,
+                        sampling_params,
+                        request_id_item,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
+                    )
+
+                generators.append(generator)
+        except ValueError as e:
+            return self.create_error_response(e)
 
         result_generator = merge_async_iterators(*generators)
 

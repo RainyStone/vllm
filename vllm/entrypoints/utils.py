@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask, BackgroundTasks
 
 from vllm import envs
+from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorInfo,
@@ -228,12 +229,19 @@ def get_max_tokens(
     input_length: int,
     default_sampling_params: dict,
     override_max_tokens: int | None = None,
+    request_id: str | None = None,
+    vllm_config: VllmConfig | None = None,
 ) -> int:
     if max_model_len < input_length:
         raise ValueError(
             f"Input length ({input_length}) exceeds model's maximum "
             f"context length ({max_model_len})."
         )
+
+    if vllm_config and vllm_config.kv_transfer_config and \
+        not vllm_config.kv_transfer_config.is_kv_consumer:
+        # Force the prefill node to set max_tokens=1
+        return 1
     model_max_tokens = max_model_len - input_length
     platform_max_tokens = current_platform.get_max_output_tokens(input_length)
     fallback_max_tokens = (
@@ -242,7 +250,7 @@ def get_max_tokens(
         else default_sampling_params.get("max_tokens")
     )
 
-    return min(
+    final_max_token = min(
         val
         for val in (
             model_max_tokens,
@@ -252,6 +260,20 @@ def get_max_tokens(
         )
         if val is not None
     )
+
+    if max_tokens is not None and final_max_token < max_tokens:
+        logger.warning(
+            f"Modified request {request_id}: "
+            f"This model's maximum context length is "
+            f"{max_model_len} tokens. However, you requested "
+            f"{max_tokens + input_length} tokens "
+            f"({input_length} in the messages, "
+            f"{max_tokens} in the completion). "
+            f"Theta vllm-ascend will automatically truncate the "
+            f"output tokens to {final_max_token} to fit the model's context length."
+        )
+
+    return final_max_token
 
 
 def log_non_default_args(args: Namespace | EngineArgs):

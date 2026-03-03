@@ -190,7 +190,7 @@ class TokenizeParams:
         if self.max_total_tokens is None:
             return None
 
-        return self.max_total_tokens - self.max_output_tokens
+        return self.max_total_tokens
 
     def __post_init__(self) -> None:
         max_total_tokens = self.max_total_tokens
@@ -320,7 +320,7 @@ class TokenizeParams:
         if self.truncate_prompt_tokens is None and tokenizer is not None:
             max_input_chars = max_input_tokens * tokenizer.max_chars_per_token
 
-            if len(text) > max_input_chars:
+            if len(text) >= max_input_chars:
                 # To save resources, fail the request outright without even
                 # attempting tokenization
                 raise VLLMValidationError(
@@ -408,7 +408,7 @@ class TokenizeParams:
         if max_input_tokens is None:
             return tokens
 
-        if len(tokens) > max_input_tokens:
+        if len(tokens) >= max_input_tokens:
             token_count = len(tokens)
             # The tokenizer may have truncated the prompt to
             # max_input_tokens + 1 (see get_encode_kwargs), so the
