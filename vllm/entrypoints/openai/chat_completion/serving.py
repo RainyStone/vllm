@@ -209,6 +209,18 @@ class OpenAIServingChat(OpenAIServing):
             raise self.engine_client.dead_error
 
         try:
+            if len(request.messages) == 0:
+                raise ValueError("Empty messages list")
+            # Enable chat prefix completion when the final chat message
+            # is authored by the assistant.
+            if request.messages[-1].get("role") == "assistant":
+                logger.info(
+                    "Request %s enabled chat prefix completion",
+                    request.request_id,
+                )
+                request.continue_final_message = True
+                request.add_generation_prompt = False
+
             return await self.openai_serving_render.render_chat(request)
         except Exception as e:
             logger.exception("Error in preprocessing prompt inputs")
