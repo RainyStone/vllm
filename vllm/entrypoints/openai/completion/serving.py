@@ -132,6 +132,8 @@ class OpenAIServingCompletion(OpenAIServing):
                 "Streaming is not currently supported with beam search"
             )
 
+        # Record API server arrival time
+        api_server_arrival_time = time.time()
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
         request.request_id = request_id
         self._log_arrival(request_id)
@@ -217,6 +219,14 @@ class OpenAIServingCompletion(OpenAIServing):
                     else await self._get_trace_headers(raw_request.headers)
                 )
 
+                # Build metrics dict for observability
+                # Note: Completion API typically doesn't involve multimodal data,
+                # so mm_load timestamps are set to 0.0
+                # process_input_finish_time will be set in InputProcessor
+                metrics = {
+                    "api_server_arrival_time": api_server_arrival_time,
+                }
+
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.beam_search(
                         prompt=engine_prompt,
@@ -234,6 +244,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         trace_headers=trace_headers,
                         priority=request.priority,
                         data_parallel_rank=data_parallel_rank,
+                        metrics=metrics,
                     )
 
                 generators.append(generator)

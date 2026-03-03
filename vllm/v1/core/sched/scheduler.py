@@ -55,7 +55,7 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, IterStats, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -918,6 +918,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            scheduled_at=time.time(),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1329,6 +1330,22 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+
+        # Collect iteration statistics for token-level profiling
+        token_level_profiling = (
+            self.vllm_config.observability_config.token_level_profiling
+            if hasattr(self.vllm_config.observability_config, 'token_level_profiling')
+            else False
+        )
+
+        iter_batch_size = len(self.running) if token_level_profiling else 0
+        iter_waiting_size = len(self.waiting) if token_level_profiling else 0
+        iter_total_tokens_count = (
+            sum(r.num_tokens for r in self.running) if token_level_profiling else 0
+        )
+        token_output_time = int(time.time() * 1000.0) if token_level_profiling else 0
+        schedule_time = int(scheduler_output.scheduled_at * 1000.0) if token_level_profiling else 0
+
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
@@ -1441,6 +1458,21 @@ class Scheduler(SchedulerInterface):
                 or kv_transfer_params
                 or stopped
             ):
+                # Create IterStats if token-level profiling is enabled
+                iter_stats = None
+                if token_level_profiling:
+                    # Reuse new_logprobs (already sliced for this request)
+                    # for tracing purposes
+                    iter_stats = IterStats(
+                        logprobs_tensors_for_trace=new_logprobs,
+                        iter_total_tokens_count=iter_total_tokens_count,
+                        iter_waiting_size=iter_waiting_size,
+                        iter_batch_size=iter_batch_size,
+                        token_scheduled_time=schedule_time,
+                        token_output_time=token_output_time,
+                        num_cached_tokens=request.num_cached_tokens,
+                    )
+
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1460,6 +1492,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        iter_stats=iter_stats,
                     )
                 )
             else:
@@ -1739,7 +1772,16 @@ class Scheduler(SchedulerInterface):
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
-                request.record_event(EngineCoreEventType.QUEUED)
+                import os
+                process_info = {
+                    "pid": os.getpid(),
+                }
+                try:
+                    import setproctitle
+                    process_info["process_name"] = setproctitle.getproctitle()
+                except ImportError:
+                    pass
+                request.record_event(EngineCoreEventType.QUEUED, attributes=process_info)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2116,6 +2158,9 @@ class Scheduler(SchedulerInterface):
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
+            # Record event for tracing
+            if self.log_stats:
+                req.record_event(EngineCoreEventType.KV_CACHE_TRANSFER_RECVING_FINSHED)
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
@@ -2124,6 +2169,11 @@ class Scheduler(SchedulerInterface):
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
+            # Record event for tracing
+            if self.log_stats:
+                self.requests[req_id].record_event(
+                    EngineCoreEventType.KV_CACHE_TRANSFER_SENDING_FINISHED
+                )
             self._free_blocks(self.requests[req_id])
 
     def _update_requests_with_invalid_blocks(

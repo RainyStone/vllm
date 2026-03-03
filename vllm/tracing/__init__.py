@@ -5,9 +5,15 @@ import functools
 from collections.abc import Callable
 from typing import Any, TypeAlias
 
+# Trace level constants
+NORMAL_TRACE_LEVEL = 1
+ENHANCED_TRACE_LEVEL = 2
+APP_NAME = "vllm"
+
 # Import the implementation details
 from .otel import (
     SpanKind,
+    Tracer,
     extract_trace_context,
     init_otel_tracer,
     init_otel_worker_tracer,
@@ -31,11 +37,16 @@ __all__ = [
     "is_tracing_available",
     "SpanAttributes",
     "SpanKind",
+    "Tracer",
     "extract_trace_context",
     "extract_trace_headers",
     "log_tracing_disabled_warning",
     "contains_trace_headers",
     "otel_import_error_traceback",
+    # Trace level constants
+    "NORMAL_TRACE_LEVEL",
+    "ENHANCED_TRACE_LEVEL",
+    "APP_NAME",
 ]
 
 BackendAvailableFunc: TypeAlias = Callable[[], bool]

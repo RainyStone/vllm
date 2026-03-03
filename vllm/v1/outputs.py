@@ -116,6 +116,21 @@ PoolerOutput: TypeAlias = torch.Tensor | list[torch.Tensor] | list[torch.Tensor 
 
 
 @dataclass
+class IterStats:
+    """Per-iteration statistics for enhanced tracing.
+
+    This collects token-level profiling data for each iteration.
+    """
+    logprobs_tensors_for_trace: LogprobsLists | None = None
+    iter_batch_size: int = 0
+    iter_waiting_size: int = 0
+    iter_total_tokens_count: int = 0
+    token_scheduled_time: int = 0
+    token_output_time: int = 0
+    num_cached_tokens: int = 0
+
+
+@dataclass
 class SamplerOutput:
     # [num_reqs, max_num_generated_tokens]
     # Different requests can have different number of generated tokens.

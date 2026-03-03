@@ -34,6 +34,8 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer
+from vllm.tracing.otel import is_otel_available
+from vllm.observability import ObservabilityIntegration
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
@@ -139,15 +141,26 @@ class AsyncLLM(EngineClient):
             self.model_config.io_processor_plugin,
         )
 
-        # Convert TokPrompt --> EngineCoreRequest.
+# Convert TokPrompt --> EngineCoreRequest.
         self.input_processor = InputProcessor(self.vllm_config, renderer)
 
-        # Converts EngineCoreOutputs --> RequestOutput.
+        # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
+        # Create observability integration for enhanced tracing
+        self.observability_integration: ObservabilityIntegration | None = None
+        tracer = None
+        if tracing_endpoint is not None and is_otel_available():
+            from opentelemetry import trace
+            tracer = trace.get_tracer("vllm.observability")
+            self.observability_integration = ObservabilityIntegration(
+                config=self.observability_config,
+                tracer=tracer,
+            )
         self.output_processor = OutputProcessor(
             renderer.tokenizer,
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            observability_integration=self.observability_integration,
         )
 
         # EngineCore (starts the engine in background process).
@@ -312,6 +325,7 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: int | None = None,
         prompt_text: str | None = None,
         reasoning_ended: bool | None = None,
+        metrics: Mapping[str, object] | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
@@ -375,6 +389,7 @@ class AsyncLLM(EngineClient):
                 trace_headers=trace_headers,
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
+                metrics=metrics,
             )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
@@ -395,7 +410,9 @@ class AsyncLLM(EngineClient):
         params = request.params
 
         if is_pooling or params.n == 1:
-            await self._add_request(request, prompt_text, None, 0, queue)
+            await self._add_request(
+                request, prompt_text, None, 0, queue, trace_headers=trace_headers
+            )
             return queue
 
         parent_params = params
@@ -409,7 +426,8 @@ class AsyncLLM(EngineClient):
             child_request.request_id = request_id
             child_request.sampling_params = child_params
             await self._add_request(
-                child_request, prompt_text, parent_request, idx, queue
+                child_request, prompt_text, parent_request, idx, queue,
+                trace_headers=trace_headers,
             )
         return queue
 
@@ -420,9 +438,12 @@ class AsyncLLM(EngineClient):
         parent_req: ParentRequest | None,
         index: int,
         queue: RequestOutputCollector,
+        trace_headers: Mapping[str, str] | None = None,
     ):
         # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        self.output_processor.add_request(
+            request, prompt, parent_req, index, queue, trace_headers=trace_headers
+        )
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
@@ -496,7 +517,9 @@ class AsyncLLM(EngineClient):
                     prompt_text, _, _ = extract_prompt_components(
                         self.model_config, input_chunk.prompt
                     )
-                    await self._add_request(req, prompt_text, None, 0, queue)
+                    await self._add_request(
+                        req, prompt_text, None, 0, queue, trace_headers=trace_headers
+                    )
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
@@ -508,7 +531,9 @@ class AsyncLLM(EngineClient):
                 if not cancelled:
                     # Send empty final request to indicate that inputs have
                     # finished. Don't send if cancelled (session was aborted).
-                    await self._add_request(final_req, None, None, 0, queue)
+                    await self._add_request(
+                        final_req, None, None, 0, queue, trace_headers=trace_headers
+                    )
 
         # Ensure output handler is running.
         self._run_output_handler()
@@ -553,6 +578,7 @@ class AsyncLLM(EngineClient):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
+        metrics: Mapping[str, object] | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -582,6 +608,7 @@ class AsyncLLM(EngineClient):
                 data_parallel_rank=data_parallel_rank,
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
+                metrics=metrics,
             )
 
             # The output_handler task pushes items into the queue.
@@ -602,9 +629,9 @@ class AsyncLLM(EngineClient):
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
         # we abort the request if we end up here.
-        except (asyncio.CancelledError, GeneratorExit):
+        except (asyncio.CancelledError, GeneratorExit) as e:
             if q is not None:
-                await self.abort(q.request_id, internal=True)
+                await self.abort(q.request_id, internal=True, error=e)
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
             raise
@@ -721,14 +748,14 @@ class AsyncLLM(EngineClient):
         self.output_handler = asyncio.create_task(output_handler())
 
     async def abort(
-        self, request_id: str | Iterable[str], internal: bool = False
+        self, request_id: str | Iterable[str], internal: bool = False, error: BaseException = None
     ) -> None:
         """Abort RequestId in OutputProcessor and EngineCore."""
 
         request_ids = (
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
-        all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+        all_request_ids = self.output_processor.abort_requests(request_ids, internal, error=error)
         await self.engine_core.abort_requests_async(all_request_ids)
 
         if self.log_requests:

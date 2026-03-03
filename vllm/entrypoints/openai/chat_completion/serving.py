@@ -242,6 +242,8 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        # Record API server arrival time
+        api_server_arrival_time = time.time()
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
         )
@@ -251,21 +253,34 @@ class OpenAIServingChat(OpenAIServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
+        # Record API server arrival and multimodal loading timing for tracing.
+        api_server_arrival_time = time.time()
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         reasoning_parser: ReasoningParser | None = None
-        if self.reasoning_parser_cls:
-            # Pass the same chat template kwargs as used in tokenization
-            chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                request.chat_template_kwargs,
-                self.default_chat_template_kwargs,
-            )
-            reasoning_parser = self.reasoning_parser_cls(
-                tokenizer,
-                chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
-            )
+        try:
+            if self.reasoning_parser_cls:
+                # Pass the same chat template kwargs as used in tokenization
+                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                    request.chat_template_kwargs,
+                    self.default_chat_template_kwargs,
+                )
+                reasoning_parser = self.reasoning_parser_cls(
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                )
+        except RuntimeError as e:
+            logger.exception("Error in reasoning parser creation.")
+            return self.create_error_response(str(e))
+
+        # Record multimodal loading start time
+        mm_load_start_ts = time.time()
         result = await self.render_chat_request(request)
+        # Record multimodal loading end time
+        mm_load_end_ts = time.time()
+
         if isinstance(result, ErrorResponse):
             return result
 
@@ -337,6 +352,14 @@ class OpenAIServingChat(OpenAIServing):
                     else await self._get_trace_headers(raw_request.headers)
                 )
 
+                # Build metrics dict for observability
+                # Note: process_input_finish_time will be set in InputProcessor
+                metrics = {
+                    "api_server_arrival_time": api_server_arrival_time,
+                    "mm_load_start_ts": mm_load_start_ts,
+                    "mm_load_end_ts": mm_load_end_ts,
+                }
+
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.beam_search(
                         prompt=engine_prompt,
@@ -361,6 +384,7 @@ class OpenAIServingChat(OpenAIServing):
                         priority=request.priority,
                         data_parallel_rank=data_parallel_rank,
                         reasoning_ended=reasoning_ended,
+                        metrics=metrics,
                     )
 
                 generators.append(generator)

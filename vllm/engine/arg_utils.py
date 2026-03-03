@@ -551,6 +551,8 @@ class EngineArgs:
         ObservabilityConfig.enable_logging_iteration_details
     )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
+    token_level_profiling: bool = ObservabilityConfig.token_level_profiling
+    trace_logprobs: int | None = ObservabilityConfig.trace_logprobs
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
@@ -1168,6 +1170,14 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-logging-iteration-details",
             **observability_kwargs["enable_logging_iteration_details"],
+        )
+        observability_group.add_argument(
+            "--token-level-profiling",
+            **observability_kwargs["token_level_profiling"],
+        )
+        observability_group.add_argument(
+            "--trace-logprobs",
+            **observability_kwargs["trace_logprobs"],
         )
 
         # Scheduler arguments
@@ -1889,6 +1899,8 @@ class EngineArgs:
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
+            token_level_profiling=self.token_level_profiling,
+            trace_logprobs=self.trace_logprobs,
         )
 
         # Compilation config overrides

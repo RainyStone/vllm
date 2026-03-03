@@ -18,6 +18,7 @@ from vllm.inputs import ProcessorInputs, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.observability import ObservabilityIntegration
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
@@ -27,6 +28,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer
+from vllm.tracing.otel import is_otel_available
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
@@ -99,12 +101,25 @@ class LLMEngine:
         # Convert TokPrompt --> EngineCoreRequest.
         self.input_processor = InputProcessor(self.vllm_config, renderer)
 
+        # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
+        # Create observability integration for enhanced tracing
+        self.observability_integration: ObservabilityIntegration | None = None
+        tracer = None
+        if tracing_endpoint is not None and is_otel_available():
+            from opentelemetry import trace
+            tracer = trace.get_tracer("vllm.observability")
+            self.observability_integration = ObservabilityIntegration(
+                config=self.observability_config,
+                tracer=tracer,
+            )
+
         # Converts EngineCoreOutputs --> RequestOutput.
         self.output_processor = OutputProcessor(
             renderer.tokenizer,
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            observability_integration=self.observability_integration,
         )
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)

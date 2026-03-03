@@ -238,6 +238,9 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Timestamp when this scheduler output was created (for tracing).
+    scheduled_at: float = 0.0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

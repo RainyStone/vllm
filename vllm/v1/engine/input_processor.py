@@ -197,6 +197,7 @@ class InputProcessor:
         priority: int = 0,
         data_parallel_rank: int | None = None,
         resumable: bool = False,
+        metrics: Mapping[str, object] | None = None,
     ) -> EngineCoreRequest:
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
@@ -256,6 +257,12 @@ class InputProcessor:
         if isinstance(params, SamplingParams):
             # TODO: can we avoid cloning here in multiproc case?
             sampling_params = params.clone()
+
+            # For enhanced tracing: use max of trace_logprobs and sampling_params.logprobs
+            trace_logprobs = getattr(self.observability_config, 'trace_logprobs', None)
+            if trace_logprobs is not None and trace_logprobs > 0:
+                sampling_params.logprobs = max(sampling_params.logprobs or 0, trace_logprobs)
+
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
                 seq_len = length_from_prompt_token_ids_or_embeds(
@@ -310,6 +317,12 @@ class InputProcessor:
                     )
                 )
 
+        # Record process input finish time for observability
+        process_input_finish_time = time.time()
+        if metrics is None:
+            metrics = {}
+        metrics["process_input_finish_time"] = process_input_finish_time
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -324,6 +337,7 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            metrics=metrics,
         )
 
     def _validate_prompt_len(

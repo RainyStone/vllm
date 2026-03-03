@@ -15,7 +15,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.outputs import IterStats, LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -93,6 +93,9 @@ class EngineCoreRequest(
     trace_headers: Mapping[str, str] | None = None
     resumable: bool = False
 
+    # Metrics for observability (passed from API server)
+    metrics: Mapping[str, object] | None = None
+
     # The user-provided request ID. This field is set internally,
     # copied from the provided request_id that's originally assigned
     # to the request_id field, see InputProcessor.assign_request_id().
@@ -116,6 +119,23 @@ class EngineCoreEventType(enum.IntEnum):
     QUEUED = 1
     SCHEDULED = 2
     PREEMPTED = 3
+    KV_CACHE_TRANSFER_SENDING_FINISHED = 4
+    KV_CACHE_TRANSFER_RECVING_FINSHED = 5
+
+
+# Event type to name mapping
+_EVENT_MAP: dict[EngineCoreEventType, str] = {
+    EngineCoreEventType.QUEUED: "queued",
+    EngineCoreEventType.SCHEDULED: "scheduled",
+    EngineCoreEventType.PREEMPTED: "preempted",
+    EngineCoreEventType.KV_CACHE_TRANSFER_SENDING_FINISHED: "kv_cache_transfer_sending_finished",
+    EngineCoreEventType.KV_CACHE_TRANSFER_RECVING_FINSHED: "kv_cache_transfer_recving_finished",
+}
+
+
+def get_event_name(event_type: EngineCoreEventType) -> str:
+    """Get the human-readable name for an event type."""
+    return _EVENT_MAP.get(event_type, f"unknown_event_{event_type}")
 
 
 class EngineCoreEvent(msgspec.Struct):
@@ -128,13 +148,20 @@ class EngineCoreEvent(msgspec.Struct):
 
     type: EngineCoreEventType
     timestamp: float
+    wall_clock_timestamp: float = 0.0
+    attributes: dict[str, Any] | None = None
 
     @classmethod
     def new_event(
-        cls, event_type: EngineCoreEventType, timestamp: float | None = None
+        cls,
+        event_type: EngineCoreEventType,
+        timestamp: float | None = None,
+        attributes: dict[str, Any] | None = None,
     ) -> "EngineCoreEvent":
         timestamp = time.monotonic() if timestamp is None else timestamp
-        return cls(event_type, timestamp)
+        # Calculate wall clock time from monotonic timestamp
+        wall_clock_timestamp = time.time()
+        return cls(event_type, timestamp, wall_clock_timestamp, attributes)
 
 
 class EngineCoreOutput(
@@ -167,6 +194,9 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+
+    # Per-iteration statistics for enhanced tracing.
+    iter_stats: IterStats | None = None
 
     @property
     def finished(self) -> bool:

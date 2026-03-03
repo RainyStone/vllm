@@ -5,12 +5,13 @@ import asyncio
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Mapping, Optional, cast
 
 import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+from vllm.observability import ObservableContext, ObservabilityIntegration
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -149,6 +150,10 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        observable_context: ObservableContext | None = None,
+        request_params: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        metrics: Mapping[str, object] | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -174,8 +179,19 @@ class RequestState:
         self.num_cached_tokens = 0
         self.num_local_cached_tokens = 0
         self.num_external_cached_tokens = 0
+        self.observable_context = observable_context
+        self.request_params = request_params
+        self.trace_headers = trace_headers
 
-        self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+        self.stats = (
+            RequestStateStats(
+                arrival_time=arrival_time,
+                api_server_arrival_time=metrics.get("api_server_arrival_time", 0.0) if metrics else 0.0,
+                mm_load_start_ts=metrics.get("mm_load_start_ts", 0.0) if metrics else 0.0,
+                mm_load_end_ts=metrics.get("mm_load_end_ts", 0.0) if metrics else 0.0,
+                process_input_finish_time=metrics.get("process_input_finish_time", 0.0) if metrics else 0.0,
+            ) if log_stats else None
+        )
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -217,7 +233,25 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        observable_context: ObservableContext | None = None,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> "RequestState":
+        # Generate request params for tracing
+        def gen_request_params():
+            ret: dict[str, Any] = {}
+            if sampling_params := request.sampling_params:
+                ret["top_p"] = sampling_params.top_p
+                ret["top_k"] = sampling_params.top_k
+                ret["temperature"] = sampling_params.temperature
+                ret["max_tokens"] = sampling_params.max_tokens
+                ret["frequency_penalty"] = sampling_params.frequency_penalty
+                ret["repetition_penalty"] = sampling_params.repetition_penalty
+                ret["presence_penalty"] = sampling_params.presence_penalty
+                ret["min_p"] = sampling_params.min_p
+                ret["min_tokens"] = sampling_params.min_tokens
+                ret["n"] = sampling_params.n
+            return ret
+
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
                 tokenizer = None
@@ -266,6 +300,10 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            observable_context=observable_context,
+            request_params=gen_request_params(),
+            trace_headers=trace_headers,
+            metrics=request.metrics,
         )
 
     def make_request_output(
@@ -424,6 +462,7 @@ class OutputProcessor:
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        observability_integration: ObservabilityIntegration | None = None,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -432,7 +471,9 @@ class OutputProcessor:
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
         self.lora_states = LoRARequestStates(log_stats)
-        self.tracing_enabled = tracing_enabled
+        self.tracing_enabled: bool = tracing_enabled
+        # Observability integration for enhanced tracing
+        self.observability = observability_integration
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -447,7 +488,12 @@ class OutputProcessor:
             assert state.queue is not None
             state.queue.put(e)
 
-    def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
+    def abort_requests(
+        self,
+        request_ids: Iterable[str],
+        internal: bool,
+        error: BaseException | None = None,
+    ) -> list[str]:
         """Abort a list of requests.
 
         The request_ids may be either external request IDs (those passed to
@@ -500,11 +546,21 @@ class OutputProcessor:
                     )
                 ):
                     req_state.queue.put(request_output)
+                # Perform tracing for aborted request
+                if self.observability and self.tracing_enabled:
+                    self.observability.finish_request(
+                        _context=req_state.observable_context,
+                        req_state=req_state,
+                        engine_core_output=None,
+                        iteration_stats=None,
+                        trace_headers=req_state.trace_headers,
+                        error=error,
+                    )
             elif parent := self.parent_requests.get(request_id):
                 # Abort children prior to removing the parent.
                 if parent.child_requests:
                     child_reqs = list(parent.child_requests)
-                    child_reqs = self.abort_requests(child_reqs, internal=True)
+                    child_reqs = self.abort_requests(child_reqs, internal=True, error=error)
                     request_ids_to_abort.extend(child_reqs)
                 self.parent_requests.pop(request_id, None)
         return request_ids_to_abort
@@ -516,12 +572,18 @@ class OutputProcessor:
         parent_req: ParentRequest | None = None,
         request_index: int = 0,
         queue: RequestOutputCollector | None = None,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> None:
         request_id = request.request_id
         req_state = self.request_states.get(request_id)
         if req_state is not None:
             self._update_streaming_request_state(req_state, request, prompt)
             return
+
+        # Create observable context if observability is enabled
+        observable_context = None
+        if self.observability:
+            observable_context = self.observability.create_context(self.tokenizer)
 
         req_state = RequestState.from_new_request(
             tokenizer=self.tokenizer,
@@ -532,6 +594,8 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            observable_context=observable_context,
+            trace_headers=trace_headers,
         )
         self.request_states[request_id] = req_state
         if parent_req:
@@ -665,6 +729,19 @@ class OutputProcessor:
                     # LLMEngine: return list of RequestOutputs.
                     request_outputs.append(request_output)
 
+            # 5) Update observable context for token-level profiling
+            if req_state.observable_context and pooling_output is None:
+                # Get delta_text from request_output if available
+                if request_output and request_output.outputs:
+                    delta_text = request_output.outputs[0].text
+                else:
+                    delta_text = ""
+                self.observability.process_output(
+                    req_state.observable_context,
+                    engine_core_output,
+                    delta_text,
+                )
+
             # Free completed requests.
             if finish_reason is not None:
                 if req_state.streaming_input:
@@ -685,7 +762,7 @@ class OutputProcessor:
                         req_state, finish_reason, iteration_stats
                     )
                     if self.tracing_enabled:
-                        self.do_tracing(engine_core_output, req_state, iteration_stats)
+                        self._do_tracing(engine_core_output, req_state, iteration_stats)
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,
@@ -709,12 +786,18 @@ class OutputProcessor:
     def update_scheduler_stats(self, scheduler_stats: SchedulerStats | None):
         self.lora_states.update_scheduler_stats(scheduler_stats)
 
-    def do_tracing(
+    def _do_tracing(
         self,
         engine_core_output: EngineCoreOutput,
         req_state: RequestState,
         iteration_stats: IterationStats | None,
     ) -> None:
+        """Perform tracing for a completed request.
+
+        Uses the observability integration if available, otherwise falls back
+        to basic tracing.
+        """
+        # Prepare common tracing data
         assert req_state.stats is not None
         assert iteration_stats is not None
 
@@ -763,6 +846,19 @@ class OutputProcessor:
         if req_state.n:
             attributes[SpanAttributes.GEN_AI_REQUEST_N] = req_state.n
 
+        # Use observability integration if available
+        if self.observability:
+            self.observability.finish_request(
+                _context=req_state.observable_context,
+                req_state=req_state,
+                engine_core_output=engine_core_output,
+                iteration_stats=iteration_stats,
+                trace_headers=req_state.trace_headers,
+                attributes=attributes,
+            )
+            return
+
+        # Fallback to basic tracing (original behavior)
         instrument_manual(
             span_name="llm_request",
             start_time=arrival_time_ns,

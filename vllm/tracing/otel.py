@@ -74,6 +74,7 @@ def init_otel_tracer(
     os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = otlp_traces_endpoint
 
     resource_attrs = {}
+    resource_attrs["service.name"] = "vllm"
     resource_attrs["vllm.instrumenting_module_name"] = instrumenting_module_name
     resource_attrs["vllm.process_id"] = str(os.getpid())
     if extra_attributes:
@@ -92,7 +93,7 @@ def init_otel_tracer(
 
 
 def get_span_exporter(endpoint):
-    protocol = os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "grpc")
+    protocol = os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "http/protobuf")
     if protocol == "grpc":
         exporter = OTLPGrpcExporter(endpoint=endpoint, insecure=True)
     elif protocol == "http/protobuf":

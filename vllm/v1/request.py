@@ -271,8 +271,9 @@ class Request:
         self,
         event_type: EngineCoreEventType,
         timestamp: float | None = None,
+        attributes: dict[str, Any] | None = None,
     ) -> None:
-        self.events.append(EngineCoreEvent.new_event(event_type, timestamp))
+        self.events.append(EngineCoreEvent.new_event(event_type, timestamp, attributes))
 
     def take_events(self) -> list[EngineCoreEvent] | None:
         if not self.events:

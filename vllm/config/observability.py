@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from functools import cached_property
 from typing import Any, Literal, cast
 
@@ -9,7 +10,10 @@ from pydantic import Field, field_validator, model_validator
 
 from vllm import version
 from vllm.config.utils import config
+from vllm.logger import init_logger
 from vllm.utils.hashing import safe_hash
+
+logger = init_logger(__name__)
 
 DetailedTraceModules = Literal["model", "worker", "all"]
 
@@ -75,6 +79,16 @@ class ObservabilityConfig:
     If set, vllm EngineCore will log iteration details
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
+
+    # Enhanced tracing configuration
+    token_level_profiling: bool = False
+    """Enable token-level profiling to collect detailed timing information
+    for each token in traces."""
+
+    trace_logprobs: int | None = None
+    """Enable enhanced tracing to display top-N log probabilities (logprobs)
+    in traces. When set to a positive integer N, this activates enhanced
+    tracing functionality."""
 
     @cached_property
     def collect_model_forward_time(self) -> bool:
@@ -145,8 +159,46 @@ class ObservabilityConfig:
 
     @model_validator(mode="after")
     def _validate_tracing_config(self):
+        # Handle otlp_traces_endpoint to prioritize environment variable
+        otlp_traces_endpoint = self.otlp_traces_endpoint
+        if not otlp_traces_endpoint:
+            otlp_traces_endpoint = os.environ.get("OTLP_TRACES_ENDPOINT")
+            if otlp_traces_endpoint:
+                logger.info(
+                    f"Using OTLP_TRACES_ENDPOINT from environment: "
+                    f"{otlp_traces_endpoint}"
+                )
+                self.otlp_traces_endpoint = otlp_traces_endpoint
+
+        token_level_profiling = self.token_level_profiling
+        if not token_level_profiling:
+            token_level_profiling = os.environ.get("ENABLE_TRACE") == "1"
+            if token_level_profiling:
+                logger.info("Enabling token-level profiling by environment variable")
+                self.token_level_profiling = token_level_profiling
+
+        trace_logprobs = self.trace_logprobs
+        if not trace_logprobs:
+            trace_logprobs = int(os.environ.get("TRACE_LOGPROBS", 0))
+            if trace_logprobs:
+                logger.info(
+                    f"Enabling trace logprobs {trace_logprobs} by environment "
+                    f"variable"
+                )
+                self.trace_logprobs = trace_logprobs
+
         if self.collect_detailed_traces and not self.otlp_traces_endpoint:
             raise ValueError(
                 "collect_detailed_traces requires `--otlp-traces-endpoint` to be set."
             )
+
+        if (self.trace_logprobs or self.token_level_profiling) and not self.otlp_traces_endpoint:
+            raise ValueError(
+                "'otlp_traces_endpoint' is not set. Enhanced tracing and "
+                "token-level profiling cannot be enabled"
+            )
+
+        if self.trace_logprobs:
+            self.token_level_profiling = True
+
         return self
