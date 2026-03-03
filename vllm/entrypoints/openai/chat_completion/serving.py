@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.entrypoints.openai.engine.protocol import FinishedStatsMetadata
+
 import asyncio
 import json
 import time
@@ -106,6 +108,7 @@ class OpenAIServingChat(OpenAIServing):
         enable_log_outputs: bool = False,
         enable_log_deltas: bool = True,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        log_stats: bool = True,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -122,6 +125,7 @@ class OpenAIServingChat(OpenAIServing):
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.enable_log_outputs = enable_log_outputs
         self.enable_log_deltas = enable_log_deltas
+        self.log_stats = log_stats
 
         # set up reasoning parser
         self.reasoning_parser_cls = ParserManager.get_reasoning_parser(
@@ -554,6 +558,7 @@ class OpenAIServingChat(OpenAIServing):
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
+        prompt_tokens_details: PromptTokenUsageInfo | None = None
         if self.use_harmony:
             harmony_parsers = [
                 get_streamable_parser_for_assistant() for _ in range(num_choices)
@@ -619,8 +624,10 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        final_res: RequestOutput | None = None
         try:
             async for res in result_generator:
+                final_res = res
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -631,6 +638,12 @@ class OpenAIServingChat(OpenAIServing):
                 # response (by the try...catch).
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
+                    if self.enable_prompt_tokens_details and num_cached_tokens:
+                        prompt_tokens_details = PromptTokenUsageInfo(
+                            cached_tokens=num_cached_tokens,
+                            l1_cached_tokens=res.num_local_cached_tokens,
+                            l2_cached_tokens=res.num_external_cached_tokens,
+                        )
                     # Send first response for each request.n (index) with
                     # the role
                     role = self.get_chat_request_role(request)
@@ -672,6 +685,7 @@ class OpenAIServingChat(OpenAIServing):
                                 prompt_tokens=num_prompt_tokens,
                                 completion_tokens=0,
                                 total_tokens=num_prompt_tokens,
+                                prompt_tokens_details=prompt_tokens_details,
                             )
 
                         data = chunk.model_dump_json(exclude_unset=True)
@@ -708,6 +722,7 @@ class OpenAIServingChat(OpenAIServing):
                                         prompt_tokens=num_prompt_tokens,
                                         completion_tokens=0,
                                         total_tokens=num_prompt_tokens,
+                                        prompt_tokens_details=prompt_tokens_details,
                                     )
 
                                 data = chunk.model_dump_json(exclude_unset=True)
@@ -1252,12 +1267,13 @@ class OpenAIServingChat(OpenAIServing):
                     prompt_tokens=num_prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=num_prompt_tokens + completion_tokens,
+                    prompt_tokens_details=prompt_tokens_details,
                 )
-                if self.enable_prompt_tokens_details and num_cached_tokens:
-                    final_usage.prompt_tokens_details = PromptTokenUsageInfo(
-                        cached_tokens=num_cached_tokens
-                    )
-
+                finished_metadata = (
+                    FinishedStatsMetadata.from_request_output(final_res)
+                    if self.log_stats
+                    else None
+                )
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
@@ -1265,6 +1281,7 @@ class OpenAIServingChat(OpenAIServing):
                     choices=[],
                     model=model_name,
                     usage=final_usage,
+                    metadata=finished_metadata,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True
@@ -1644,17 +1661,24 @@ class OpenAIServingChat(OpenAIServing):
         )
         if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=final_res.num_cached_tokens
+                cached_tokens=final_res.num_cached_tokens,
+                l1_cached_tokens=final_res.num_local_cached_tokens,
+                l2_cached_tokens=final_res.num_external_cached_tokens,
             )
 
         request_metadata.final_usage_info = usage
-
+        finished_metadata = (
+            FinishedStatsMetadata.from_request_output(final_res)
+            if self.log_stats
+            else None
+        )
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,
             model=model_name,
             choices=choices,
             usage=usage,
+            metadata=finished_metadata,
             prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
             prompt_token_ids=(
                 final_res.prompt_token_ids if request.return_token_ids else None

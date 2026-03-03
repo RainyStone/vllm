@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -214,6 +216,8 @@ class RequestStateStats:
 
     # first token latency
     first_token_latency: float = 0.0
+
+    finished_stats: FinishedRequestStats | None = None
 
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
@@ -453,6 +457,7 @@ class IterationStats:
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
         )
+        req_stats.finished_stats = finished_req
         self.finished_requests.append(finished_req)
 
         # Count corrupted requests when they finish (only once per request)

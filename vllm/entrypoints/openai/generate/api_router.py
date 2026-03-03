@@ -136,6 +136,7 @@ async def init_generate_state(
             enable_force_include_usage=args.enable_force_include_usage,
             enable_log_outputs=args.enable_log_outputs,
             enable_log_deltas=args.enable_log_deltas,
+            log_stats=state.log_stats,
         )
         if "generate" in supported_tasks
         else None
@@ -151,6 +152,7 @@ async def init_generate_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            log_stats=state.log_stats,
         )
         if "generate" in supported_tasks
         else None

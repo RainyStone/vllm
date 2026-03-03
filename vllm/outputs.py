@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.v1.metrics.stats import FinishedRequestStats
+
 from collections.abc import MutableSequence
 from collections.abc import Sequence as GenericSequence
 from dataclasses import dataclass
@@ -102,7 +104,9 @@ class RequestOutput:
                         None if decoder-only.
         encoder_prompt_token_ids: The token IDs of the encoder prompt.
                                   None if decoder-only.
-        num_cached_tokens: The number of tokens with prefix cache hit.
+        num_cached_tokens: The number of tokens with prefix cache hit(local + external).
+        num_local_cached_tokens: The number of tokens with local prefix cache hit.
+        num_external_cached_tokens: The number of tokens with external prefix cache hit.
         kv_transfer_params: The params for remote K/V transfer.
     """
 
@@ -119,8 +123,11 @@ class RequestOutput:
         encoder_prompt: str | None = None,
         encoder_prompt_token_ids: list[int] | None = None,
         num_cached_tokens: int | None = None,
+        num_local_cached_tokens: int | None = None,
+        num_external_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        finished_stats: FinishedRequestStats | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -140,13 +147,17 @@ class RequestOutput:
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
+        self.num_local_cached_tokens = num_local_cached_tokens
+        self.num_external_cached_tokens = num_external_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        self.finished_stats = finished_stats
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        self.finished_stats = next_output.finished_stats
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
@@ -184,7 +195,9 @@ class RequestOutput:
             f"finished={self.finished}, "
             f"metrics={self.metrics}, "
             f"lora_request={self.lora_request}, "
-            f"num_cached_tokens={self.num_cached_tokens})"
+            f"num_cached_tokens={self.num_cached_tokens}, "
+            f"num_local_cached_tokens={self.num_local_cached_tokens}, "
+            f"num_external_cached_tokens={self.num_external_cached_tokens})"
         )
 
 

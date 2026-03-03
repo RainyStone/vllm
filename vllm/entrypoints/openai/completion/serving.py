@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.entrypoints.openai.engine.protocol import FinishedStatsMetadata
+
 import asyncio
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -59,6 +61,7 @@ class OpenAIServingCompletion(OpenAIServing):
         return_tokens_as_token_ids: bool = False,
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
+        log_stats: bool = True,
     ):
         super().__init__(
             engine_client=engine_client,
@@ -68,6 +71,7 @@ class OpenAIServingCompletion(OpenAIServing):
         )
 
         self.openai_serving_render = openai_serving_render
+        self.log_stats = log_stats
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
 
@@ -318,6 +322,7 @@ class OpenAIServingCompletion(OpenAIServing):
         has_echoed = [False] * num_choices * num_prompts
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
+        prompt_tokens_details: PromptTokenUsageInfo | None = None
         first_iteration = True
 
         stream_options = request.stream_options
@@ -325,14 +330,21 @@ class OpenAIServingCompletion(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        final_res: RequestOutput | None = None
         try:
             async for prompt_idx, res in result_generator:
+                final_res = res
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
 
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
-                    first_iteration = False
+                    if self.enable_prompt_tokens_details and num_cached_tokens:
+                        prompt_tokens_details = PromptTokenUsageInfo(
+                            cached_tokens=num_cached_tokens,
+                            l1_cached_tokens=res.num_local_cached_tokens,
+                            l2_cached_tokens=res.num_external_cached_tokens,
+                        )
 
                 prompt_text = res.prompt
                 if prompt_text is None:
@@ -445,10 +457,15 @@ class OpenAIServingCompletion(OpenAIServing):
                             prompt_tokens=prompt_tokens,
                             completion_tokens=completion_tokens,
                             total_tokens=prompt_tokens + completion_tokens,
+                            prompt_tokens_details=(
+                                prompt_tokens_details if first_iteration else None
+                            ),
                         )
 
                     response_json = chunk.model_dump_json(exclude_unset=False)
                     yield f"data: {response_json}\n\n"
+                if first_iteration:
+                    first_iteration = False
 
             total_prompt_tokens = sum(num_prompt_tokens)
             total_completion_tokens = sum(previous_num_tokens)
@@ -456,20 +473,22 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 total_tokens=total_prompt_tokens + total_completion_tokens,
+                prompt_tokens_details=prompt_tokens_details,
             )
 
-            if self.enable_prompt_tokens_details and num_cached_tokens:
-                final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
-                    cached_tokens=num_cached_tokens
-                )
-
             if include_usage:
+                finished_metadata = (
+                    FinishedStatsMetadata.from_request_output(final_res)
+                    if self.log_stats
+                    else None
+                )
                 final_usage_chunk = CompletionStreamResponse(
                     id=request_id,
                     created=created_time,
                     model=model_name,
                     choices=[],
                     usage=final_usage_info,
+                    metadata=finished_metadata,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True
@@ -587,9 +606,15 @@ class OpenAIServingCompletion(OpenAIServing):
             and last_final_res.num_cached_tokens
         ):
             usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=last_final_res.num_cached_tokens
+                cached_tokens=last_final_res.num_cached_tokens,
+                l1_cached_tokens=last_final_res.num_local_cached_tokens,
+                l2_cached_tokens=last_final_res.num_external_cached_tokens,
             )
-
+        finished_metadata = (
+            FinishedStatsMetadata.from_request_output(final_res)
+            if self.log_stats
+            else None
+        )
         request_metadata.final_usage_info = usage
         if final_res_batch:
             kv_transfer_params = final_res_batch[0].kv_transfer_params
@@ -599,6 +624,7 @@ class OpenAIServingCompletion(OpenAIServing):
             model=model_name,
             choices=choices,
             usage=usage,
+            metadata=finished_metadata,
             kv_transfer_params=kv_transfer_params,
         )
 

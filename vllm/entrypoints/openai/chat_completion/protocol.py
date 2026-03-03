@@ -3,6 +3,9 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+
+from vllm.entrypoints.openai.engine.protocol import FinishedStatsMetadata
+
 import json
 import time
 from typing import Annotated, Any, ClassVar, Literal
@@ -110,6 +113,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    metadata: FinishedStatsMetadata | None = Field(default=None)
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -131,6 +135,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     usage: UsageInfo | None = Field(default=None)
     # not part of the OpenAI spec but for tracing the tokens
     prompt_token_ids: list[int] | None = None
+    metadata: FinishedStatsMetadata | None = Field(default=None)
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):

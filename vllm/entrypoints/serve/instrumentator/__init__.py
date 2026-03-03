@@ -3,8 +3,6 @@
 
 from fastapi import FastAPI
 
-from vllm import envs
-
 
 def register_instrumentator_api_routers(app: FastAPI):
     from .basic import router as basic_router
@@ -23,7 +21,6 @@ def register_instrumentator_api_routers(app: FastAPI):
 
     offline_docs_attach_router(app)
 
-    if envs.VLLM_SERVER_DEV_MODE:
-        from .server_info import router as server_info_router
+    from .server_info import router as server_info_router
 
-        app.include_router(server_info_router)
+    app.include_router(server_info_router)

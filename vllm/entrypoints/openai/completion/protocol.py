@@ -3,6 +3,9 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+
+from vllm.entrypoints.openai.engine.protocol import FinishedStatsMetadata
+
 import json
 import time
 from typing import Annotated, Any, Literal
@@ -483,6 +486,7 @@ class CompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    metadata: FinishedStatsMetadata | None = Field(default=None)
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
@@ -511,3 +515,6 @@ class CompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: list[CompletionResponseStreamChoice]
     usage: UsageInfo | None = Field(default=None)
+
+    # vLLM-specific fields that are not in OpenAI spec
+    metadata: FinishedStatsMetadata | None = Field(default=None)

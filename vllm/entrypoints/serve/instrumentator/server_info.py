@@ -57,3 +57,24 @@ async def show_server_info(
         "system_env": await asyncio.to_thread(_get_system_env_info_cached),
     }
     return JSONResponse(content=server_info)
+
+
+# Used by AIGW
+@router.get("/simple_server_info")
+async def show_simple_server_info(raw_request: Request):
+    vllm_config: VllmConfig = raw_request.app.state.vllm_config
+    dp_size = vllm_config.parallel_config.data_parallel_size
+    # All fields represent values under single DP; AIGW converts them during use.
+    simple_server_info = {
+        "dp_size": dp_size,
+        "max_running_requests": vllm_config.scheduler_config.max_num_seqs,
+        "page_size": vllm_config.cache_config.block_size,
+        "max_total_tokens": vllm_config.cache_config.num_gpu_tokens // dp_size,
+        "graph_batch_sizes": (
+            vllm_config.compilation_config.cudagraph_capture_sizes
+            if not vllm_config.model_config.enforce_eager
+            else []
+        ),
+        "chunked_prefill_size": vllm_config.scheduler_config.max_num_batched_tokens
+    }
+    return JSONResponse(content=simple_server_info)

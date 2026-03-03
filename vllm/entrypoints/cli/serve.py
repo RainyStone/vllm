@@ -296,14 +296,17 @@ def run_multi_api_server(args: argparse.Namespace):
             else None,
         )
 
-        # For dp ranks > 0 in external/hybrid DP LB modes, we must delay the
-        # start of the API servers until the local engine is started
-        # (after the launcher context manager exits),
-        # since we get the front-end stats update address from the coordinator
-        # via the handshake with the local engine.
-        if dp_rank == 0 or not parallel_config.local_engines_only:
-            # Start API servers using the manager.
-            api_server_manager = APIServerProcessManager(**api_server_manager_kwargs)
+    # Pass updated vllm_config into api_server args
+    api_server_manager_kwargs["vllm_config"] = vllm_config
+
+    # For dp ranks > 0 in external/hybrid DP LB modes, we must delay the
+    # start of the API servers until the local engine is started
+    # (after the launcher context manager exits),
+    # since we get the front-end stats update address from the coordinator
+    # via the handshake with the local engine.
+    if dp_rank == 0 or not parallel_config.local_engines_only:
+        # Start API servers using the manager.
+        api_server_manager = APIServerProcessManager(**api_server_manager_kwargs)
 
     # Start API servers now if they weren't already started.
     if api_server_manager is None:

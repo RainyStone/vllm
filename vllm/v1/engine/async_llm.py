@@ -160,6 +160,17 @@ class AsyncLLM(EngineClient):
             client_index=client_index,
         )
 
+        # Update num_gpu_blocks/num_gpu_tokens from root vllm process
+        if client_count > 1:
+            root_vllm_config: VllmConfig | None = client_addresses.get("vllm_config")
+            if root_vllm_config is not None:
+                vllm_config.cache_config.num_gpu_blocks = (
+                    root_vllm_config.cache_config.num_gpu_blocks
+                )
+                vllm_config.cache_config.num_gpu_tokens = (
+                    root_vllm_config.cache_config.num_gpu_tokens
+                )
+
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:

@@ -172,6 +172,8 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.num_local_cached_tokens = 0
+        self.num_external_cached_tokens = 0
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -370,6 +372,8 @@ class RequestState:
             finished=finished,
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            num_local_cached_tokens=self.num_local_cached_tokens,
+            num_external_cached_tokens=self.num_external_cached_tokens,
             metrics=self.stats,
         )
 
@@ -618,6 +622,8 @@ class OutputProcessor:
             kv_transfer_params = engine_core_output.kv_transfer_params
             routed_experts = engine_core_output.routed_experts
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
+            req_state.num_local_cached_tokens = engine_core_output.num_local_cached_tokens
+            req_state.num_external_cached_tokens = engine_core_output.num_external_cached_tokens
             req_state.is_prefilling = False
 
             if pooling_output is None:
@@ -644,6 +650,11 @@ class OutputProcessor:
                 kv_transfer_params,
                 routed_experts,
             ):
+                if finish_reason is not None and iteration_stats is not None:
+                    self.update_finished_req_stats(
+                        req_state, finish_reason, iteration_stats
+                    )
+                    request_output.finished_stats = req_state.stats.finished_stats
                 if req_state.streaming_input:
                     request_output.finished = False
 
@@ -782,6 +793,22 @@ class OutputProcessor:
             req_state.lora_name,
         )
 
+    @staticmethod
+    def update_finished_req_stats(
+        req_state: RequestState,
+        finish_reason: FinishReason | None,
+        iteration_stats: IterationStats | None,
+    ):
+        if req_state.stats is not None and req_state.stats.finished_stats is None:
+            iteration_stats.update_from_finished_request(
+                finish_reason=finish_reason,
+                num_prompt_tokens=length_from_prompt_token_ids_or_embeds(
+                    req_state.prompt_token_ids, req_state.prompt_embeds
+                ),
+                max_tokens_param=req_state.max_tokens_param,
+                req_stats=req_state.stats,
+            )
+
     def _update_stats_from_finished(
         self,
         req_state: RequestState,
@@ -793,13 +820,7 @@ class OutputProcessor:
 
         assert finish_reason is not None
         assert req_state.stats is not None
-        iteration_stats.update_from_finished_request(
-            finish_reason=finish_reason,
-            num_prompt_tokens=req_state.prompt_len,
-            max_tokens_param=req_state.max_tokens_param,
-            req_stats=req_state.stats,
-            num_cached_tokens=req_state.num_cached_tokens,
-        )
+        self.update_finished_req_stats(req_state, finish_reason, iteration_stats)
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 
         ParentRequest.observe_finished_request(

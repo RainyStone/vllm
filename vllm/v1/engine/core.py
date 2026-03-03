@@ -120,6 +120,7 @@ class EngineCore:
 
         # Setup KV Caches and update CacheConfig after profiling.
         kv_cache_config = self._initialize_kv_caches(vllm_config)
+        vllm_config.cache_config.num_gpu_tokens = kv_cache_config.num_tokens
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
@@ -982,6 +983,7 @@ class EngineCoreProc(EngineCore):
 
             # Send ready message.
             num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
+            num_gpu_tokens = vllm_config.cache_config.num_gpu_tokens
             # We pass back the coordinator stats update address here for the
             # external LB case for our colocated front-end to use (coordinator
             # only runs with rank 0).
@@ -993,6 +995,7 @@ class EngineCoreProc(EngineCore):
                 "local": local_client,
                 "headless": headless,
                 "num_gpu_blocks": num_gpu_blocks,
+                "num_gpu_tokens": num_gpu_tokens,
                 "dp_stats_address": dp_stats_address,
             }
             if vllm_config.parallel_config.data_parallel_size > 1:

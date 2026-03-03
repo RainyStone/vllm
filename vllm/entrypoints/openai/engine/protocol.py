@@ -3,6 +3,9 @@
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
+
+from vllm.outputs import RequestOutput
+
 import time
 from http import HTTPStatus
 from typing import Any, ClassVar, Literal, TypeAlias
@@ -99,6 +102,10 @@ class ModelList(OpenAIBaseModel):
 
 class PromptTokenUsageInfo(OpenAIBaseModel):
     cached_tokens: int | None = None
+    # local_cached_tokens
+    l1_cached_tokens: int | None = None
+    # external_cached_tokens
+    l2_cached_tokens: int | None = None
 
 
 class UsageInfo(OpenAIBaseModel):
@@ -106,6 +113,28 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+
+
+class FinishedStatsMetadata(OpenAIBaseModel):
+    # all latency fields in milliseconds(ms)
+    e2e_latency: float = 0.0
+    ttft_latency: float = 0.0
+    queue_latency: float = 0.0
+
+    @classmethod
+    def from_request_output(cls, final_res: "RequestOutput") -> "FinishedStatsMetadata":
+        finished_stats = final_res.finished_stats
+        if finished_stats is None:
+            logger.warning(
+                f"The 'finished_stats' field for request {final_res.request_id} is None"
+            )
+            return cls()
+        # converts all latency fields from seconds to milliseconds
+        return cls(
+            e2e_latency=finished_stats.e2e_latency * 1000,
+            ttft_latency=finished_stats.prefill_time * 1000,
+            queue_latency=finished_stats.queued_time * 1000,
+        )
 
 
 class RequestResponseMetadata(BaseModel):

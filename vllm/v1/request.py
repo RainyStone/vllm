@@ -148,6 +148,8 @@ class Request:
         # State
         # The number of tokens with prefix cache hits.
         self.num_cached_tokens = -1
+        self.num_local_cached_tokens = -1
+        self.num_external_cached_tokens = -1
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False

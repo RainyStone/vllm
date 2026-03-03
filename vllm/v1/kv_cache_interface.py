@@ -489,6 +489,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    """The KV cache size in number of tokens"""
+    num_tokens: int = 1
 
     @property
     def has_mamba_layers(self) -> bool:

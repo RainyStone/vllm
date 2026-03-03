@@ -23,6 +23,7 @@ import torch
 from torch.autograd.profiler import record_function
 
 import vllm.envs as envs
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import get_open_port, get_open_zmq_ipc_path, get_tcp_uri
@@ -169,6 +170,7 @@ class APIServerProcessManager:
         listen_address: str,
         sock: Any,
         args: argparse.Namespace,
+        vllm_config: VllmConfig,
         num_servers: int,
         input_addresses: list[str],
         output_addresses: list[str],
@@ -202,6 +204,7 @@ class APIServerProcessManager:
                 "output_address": out_addr,
                 "client_count": num_servers,
                 "client_index": i,
+                "vllm_config": vllm_config,
             }
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
