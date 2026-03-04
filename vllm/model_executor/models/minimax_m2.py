@@ -34,8 +34,8 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -57,6 +57,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -69,6 +70,17 @@ from .utils import (
     maybe_prefix,
 )
 
+FP8_DTYPES = tuple(
+    getattr(torch, dtype_name)
+    for dtype_name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+        "float8_e8m0fnu",
+    )
+    if hasattr(torch, dtype_name)
+)
 
 class MiniMaxM2MoE(nn.Module):
     def __init__(
@@ -135,7 +147,9 @@ class MiniMaxM2MoE(nn.Module):
         )
         final_hidden_states = final_hidden_states
         if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
+                final_hidden_states
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -174,6 +188,7 @@ class MiniMaxM2Attention(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim or (hidden_size // self.total_num_heads)
+        self.num_kv_head_replicas = max(1, tp_size // self.total_num_kv_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -221,9 +236,21 @@ class MiniMaxM2Attention(nn.Module):
         self.q_norm = MiniMaxText01RMSNormTP(
             self.head_dim * self.total_num_heads, eps=rms_norm_eps
         )
-        self.k_norm = MiniMaxText01RMSNormTP(
-            self.head_dim * self.total_num_kv_heads, eps=rms_norm_eps
-        )
+        if self.total_num_kv_heads < tp_size:
+            # KV heads are replicated across TP ranks when kv_heads < tp_size.
+            # The k_norm weight must shard by global kv_heads (not TP size),
+            # while variance reduction in forward_qk remains TP-wide.
+            self.k_norm = MiniMaxText01RMSNormTP(
+                self.head_dim * self.total_num_kv_heads,
+                eps=rms_norm_eps,
+                weight_shard_world_size=self.total_num_kv_heads,
+                weight_shard_rank=get_tensor_model_parallel_rank()
+                                  // self.num_kv_head_replicas,
+            )
+        else:
+            self.k_norm = MiniMaxText01RMSNormTP(
+                self.head_dim * self.total_num_kv_heads, eps=rms_norm_eps
+            )
 
     def forward(
         self,
@@ -397,6 +424,40 @@ class MiniMaxM2Model(nn.Module):
             num_experts=self.config.num_local_experts,
         )
 
+    def _need_dequantize_fp8_weights(self) -> bool:
+        quant_cfg = getattr(self.config, "quantization_config", None)
+        return (
+                isinstance(quant_cfg, dict)
+                and quant_cfg.get("quant_method") == "fp8"
+                and current_platform.device_name == "npu"
+        )
+
+    @staticmethod
+    def _dequantize_fp8_block_weight(
+            fp8_weight: torch.Tensor,
+            weight_scale_inv: torch.Tensor,
+            block_size: tuple[int, int],
+    ) -> torch.Tensor:
+        block_n, block_k = block_size
+        n, k = fp8_weight.shape
+
+        n_tiles = (n + block_n - 1) // block_n
+        k_tiles = (k + block_k - 1) // block_k
+        if tuple(weight_scale_inv.shape) != (n_tiles, k_tiles):
+            raise ValueError(
+                "Unexpected fp8 scale shape: "
+                f"weight={tuple(fp8_weight.shape)}, "
+                f"scale={tuple(weight_scale_inv.shape)}, "
+                f"block_size={block_size}"
+            )
+
+        expanded_scale = weight_scale_inv.repeat_interleave(
+            block_n, dim=0
+        ).repeat_interleave(block_k, dim=1)
+        expanded_scale = expanded_scale[:n, :k].to(dtype=torch.bfloat16)
+
+        return fp8_weight.to(dtype=torch.bfloat16) * expanded_scale
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -409,9 +470,45 @@ class MiniMaxM2Model(nn.Module):
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = self.get_expert_mapping()
 
+        dequantize_fp8_weights = self._need_dequantize_fp8_weights()
+        weight_block_size: tuple[int, int] = (128, 128)
+        if dequantize_fp8_weights:
+            quant_cfg = getattr(self.config, "quantization_config", {})
+            block_cfg = quant_cfg.get("weight_block_size", [128, 128])
+            if isinstance(block_cfg, list) and len(block_cfg) == 2:
+                weight_block_size = (int(block_cfg[0]), int(block_cfg[1]))
+
+        pending_fp8_weights: dict[str, torch.Tensor] = {}
+        pending_fp8_scales: dict[str, torch.Tensor] = {}
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            if dequantize_fp8_weights:
+                if name.endswith(".weight_scale_inv"):
+                    paired_weight_name = name[: -len("_scale_inv")]
+                    pending_weight = pending_fp8_weights.pop(paired_weight_name, None)
+                    if pending_weight is None:
+                        pending_fp8_scales[name] = loaded_weight
+                        continue
+                    loaded_weight = self._dequantize_fp8_block_weight(
+                        pending_weight,
+                        loaded_weight,
+                        weight_block_size,
+                    )
+                    name = paired_weight_name
+                elif loaded_weight.dtype in FP8_DTYPES and name.endswith(".weight"):
+                    scale_name = f"{name}_scale_inv"
+                    pending_scale = pending_fp8_scales.pop(scale_name, None)
+                    if pending_scale is None:
+                        pending_fp8_weights[name] = loaded_weight
+                        continue
+                    loaded_weight = self._dequantize_fp8_block_weight(
+                        loaded_weight,
+                        pending_scale,
+                        weight_block_size,
+                    )
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -482,6 +579,13 @@ class MiniMaxM2Model(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        if dequantize_fp8_weights and (pending_fp8_weights or pending_fp8_scales):
+            raise ValueError(
+                "Unpaired fp8 MiniMax-M2 weight/scale tensors detected: "
+                f"pending_weights={len(pending_fp8_weights)}, "
+                f"pending_scales={len(pending_fp8_scales)}"
+            )
         return loaded_params
 
 

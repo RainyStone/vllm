@@ -3,6 +3,7 @@
 
 import math
 from collections.abc import Callable
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
@@ -36,25 +38,54 @@ from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
 class MiniMaxText01RMSNormTP(CustomOp):
     name = "MiniMaxText01RMSNormTP"
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(
+            self,
+            hidden_size: int,
+            eps: float = 1e-6,
+            *,
+            weight_shard_world_size: int | None = None,
+            weight_shard_rank: int | None = None,
+    ) -> None:
         super().__init__()
         self.tp_world = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
-        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world)))
+        self.weight_shard_world = weight_shard_world_size or self.tp_world
+        self.weight_shard_rank = (
+            self.tp_rank if weight_shard_rank is None else weight_shard_rank
+        )
 
-        self.weight.weight_loader = self.weight_loader
+        if hidden_size % self.weight_shard_world != 0:
+            raise ValueError(
+                "MiniMaxText01RMSNormTP hidden_size must be divisible by "
+                f"weight_shard_world_size, got hidden_size={hidden_size}, "
+                f"weight_shard_world_size={self.weight_shard_world}"
+            )
+
+        self.weight = nn.Parameter(
+            torch.ones(int(hidden_size / self.weight_shard_world))
+        )
+
+        self.weight.weight_loader = partial(
+            self.weight_loader,
+            shard_world_size=self.weight_shard_world,
+            shard_rank=self.weight_shard_rank,
+        )
         self.variance_epsilon = eps
 
     @staticmethod
     def weight_loader(
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
+        shard_world_size: int | None = None,
+        shard_rank: int | None = None,
     ) -> None:
-        tp_world = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        if shard_world_size is None:
+            shard_world_size = get_tensor_model_parallel_world_size()
+        if shard_rank is None:
+            shard_rank = get_tensor_model_parallel_rank()
 
-        shard_size = loaded_weight.shape[0] // tp_world
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        shard_size = loaded_weight.shape[0] // shard_world_size
+        shard = slice(shard_rank * shard_size, (shard_rank + 1) * shard_size)
         param.data.copy_(loaded_weight[shard])
 
     def _forward(
@@ -85,6 +116,47 @@ class MiniMaxText01RMSNormTP(CustomOp):
         q: torch.Tensor,
         k: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # NPU fast path:
+        # 1) use kernelized local RMSNorm for q/k,
+        # 2) correct with TP-global rstd ratio so outputs are mathematically
+        #    equivalent to TP-global RMSNorm.
+        if current_platform.device_name == "npu":
+            q, q_inv_rms = torch.ops.npu.npu_rms_norm(
+                q, q_norm.weight, q_norm.variance_epsilon
+            )
+            k, k_inv_rms = torch.ops.npu.npu_rms_norm(
+                k, k_norm.weight, k_norm.variance_epsilon
+            )
+
+            if q_norm.tp_world > 1:
+                q_local_inv_rms = q_inv_rms.to(torch.float32)
+                if q_local_inv_rms.shape[-1] != 1:
+                    q_local_inv_rms = q_local_inv_rms.mean(dim=-1, keepdim=True)
+                q_local_var = (
+                        q_local_inv_rms.reciprocal().pow(2) - q_norm.variance_epsilon
+                ).clamp_min_(0.0)
+
+                k_local_inv_rms = k_inv_rms.to(torch.float32)
+                if k_local_inv_rms.shape[-1] != 1:
+                    k_local_inv_rms = k_local_inv_rms.mean(dim=-1, keepdim=True)
+                k_local_var = (
+                        k_local_inv_rms.reciprocal().pow(2) - k_norm.variance_epsilon
+                ).clamp_min_(0.0)
+
+                qk_var = torch.cat([q_local_var, k_local_var], dim=-1)
+                qk_var = tensor_model_parallel_all_reduce(qk_var) / q_norm.tp_world
+                q_global_var, k_global_var = qk_var.chunk(2, dim=-1)
+
+                q_local_rstd = torch.rsqrt(q_local_var + q_norm.variance_epsilon)
+                k_local_rstd = torch.rsqrt(k_local_var + k_norm.variance_epsilon)
+                q_global_rstd = torch.rsqrt(q_global_var + q_norm.variance_epsilon)
+                k_global_rstd = torch.rsqrt(k_global_var + k_norm.variance_epsilon)
+
+                q = q * (q_global_rstd / q_local_rstd).to(q.dtype)
+                k = k * (k_global_rstd / k_local_rstd).to(k.dtype)
+
+            return q, k
+
         orig_dtype = q.dtype
         q = q.to(torch.float32)
         k = k.to(torch.float32)

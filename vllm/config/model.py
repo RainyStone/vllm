@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import InitVar, field
@@ -953,6 +954,21 @@ class ModelConfig:
                     f"({self.quantization})."
                 )
 
+        # MiniMax-M2 checkpoints can be fp8 serialized with block scales.
+        # Ascend currently runs this model by dequantizing fp8 weights into
+        # bf16 during loading instead of enabling fp8 quantization kernels.
+        if (
+                self.model_arch_config.model_type == "minimax_m2"
+                and self.quantization == "fp8"
+                and current_platform.device_name == "npu"
+        ):
+            logger.warning(
+                "Detected fp8 MiniMax-M2 checkpoint on NPU. "
+                "Disabling fp8 quantization and loading dequantized bf16 "
+                "weights instead."
+            )
+            self.quantization = None
+
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(
@@ -977,6 +993,25 @@ class ModelConfig:
                 )
 
     def _verify_cuda_graph(self) -> None:
+        if (
+                self.model_arch_config.model_type == "minimax_m2"
+                and current_platform.device_name == "npu"
+                and not self.enforce_eager
+        ):
+            expansion_mode = os.environ.get("HCCL_OP_EXPANSION_MODE")
+            if expansion_mode is None:
+                os.environ["HCCL_OP_EXPANSION_MODE"] = "AIV"
+                logger.info(
+                    "Set HCCL_OP_EXPANSION_MODE=AIV for MiniMax-M2 ACL graph "
+                    "capture on NPU."
+                )
+            elif expansion_mode != "AIV":
+                logger.warning(
+                    "HCCL_OP_EXPANSION_MODE=%s may reduce ACL graph shape "
+                    "coverage for MiniMax-M2 on NPU. Recommended value: AIV.",
+                    expansion_mode,
+                )
+
         # CUDAGraph capture not supported for encoder-decoder models on ROCm
         unsupported_rocm = self.is_encoder_decoder
         if unsupported_rocm and not self.enforce_eager and current_platform.is_rocm():
