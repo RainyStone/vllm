@@ -14,6 +14,7 @@ from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
 from vllm.config.utils import replace
+from vllm.entrypoints.chat_utils import ChatCompletionContentPartParam
 from vllm.entrypoints.openai.engine.protocol import (
     AnyResponseFormat,
     LegacyStructuralTagResponseFormat,
@@ -179,6 +180,13 @@ class CompletionRequest(OpenAIBaseModel):
         "can detect such behavior and terminate early, saving time and tokens.",
     )
 
+    multi_modal_data: list[ChatCompletionContentPartParam] | None = Field(
+        default=None,
+        description=(
+            "List of multimodal content items to include with the prompt. "
+            "Each item can be an image, audio, or video."
+        ),
+    )
     # --8<-- [end:completion-extra-params]
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:

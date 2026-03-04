@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, cast
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.completion_utils import preprocess_completion_with_multi_modal
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionLogProbs,
@@ -161,6 +162,15 @@ class OpenAIServingCompletion(OpenAIServing):
             raise NotImplementedError(
                 "Batching of multiple prompts is not supported for "
                 "completion requests. Please use a single prompt.")
+
+        if request.multi_modal_data:
+            logger.info("Processing multimodal data for request %s", request_id)
+            assert engine_prompts[0]["prompt_token_ids"] is not None
+            engine_prompts = await preprocess_completion_with_multi_modal(
+                engine_prompt=engine_prompts[0],
+                request=request,
+                model_config=self.model_config
+            )
         try:
             kv_transfer_params = request.kv_transfer_params
             if kv_transfer_params is not None and \
