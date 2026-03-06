@@ -198,19 +198,19 @@ class TokenizeParams:
         max_input_tokens = self.max_input_tokens
         truncate_prompt_tokens = self.truncate_prompt_tokens
 
-        if (
-            max_output_tokens is not None
-            and max_total_tokens is not None
-            and max_output_tokens > max_total_tokens
-        ):
-            raise VLLMValidationError(
-                f"{self.max_output_tokens_param}={max_output_tokens}"
-                f"cannot be greater than "
-                f"{self.max_total_tokens_param}={max_total_tokens=}. "
-                f"Please request fewer output tokens.",
-                parameter=self.max_output_tokens_param,
-                value=max_output_tokens,
-            )
+        # if (
+        #     max_output_tokens is not None
+        #     and max_total_tokens is not None
+        #     and max_output_tokens > max_total_tokens
+        # ):
+        #     raise VLLMValidationError(
+        #         f"{self.max_output_tokens_param}={max_output_tokens}"
+        #         f"cannot be greater than "
+        #         f"{self.max_total_tokens_param}={max_total_tokens=}. "
+        #         f"Please request fewer output tokens.",
+        #         parameter=self.max_output_tokens_param,
+        #         value=max_output_tokens,
+        #     )
 
         if (
             max_input_tokens is not None
