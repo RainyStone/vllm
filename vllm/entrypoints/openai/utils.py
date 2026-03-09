@@ -47,3 +47,26 @@ async def validate_json_request(raw_request: Request):
         raise RequestValidationError(
             errors=["Unsupported Media Type: Only 'application/json' is allowed"]
         )
+
+
+def is_enable_thinking_request(request: ChatCompletionRequest) -> bool:
+    chat_template_kwargs = request.chat_template_kwargs
+
+    # if chat_template_kwargs is None, we assume thinking padding is needed
+    if chat_template_kwargs is None:
+        return True
+
+    # if "enable_thinking" exists in chat_template_kwargs, we use its value as the padding setting
+    for field in ("thinking", "enable_thinking"):
+        if field in chat_template_kwargs:
+            value = chat_template_kwargs[field]
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"chat_template_kwargs['{field}'] must be a bool, "
+                    f"got {type(value).__name__}"
+                )
+            # RequestPadding / NoRequestPadding
+            return value
+
+    # padding setting does not exist in request (DefaultPaddingSetting)
+    return True

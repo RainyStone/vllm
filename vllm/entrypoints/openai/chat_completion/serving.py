@@ -64,9 +64,12 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
     parse_chat_output,
 )
-from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
+from vllm.entrypoints.openai.utils import (
+    is_enable_thinking_request,
+    maybe_filter_parallel_tool_calls,
+)
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
-from vllm.inputs.data import ProcessorInputs
+from vllm.inputs.data import ProcessorInputs, TokensPrompt
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -575,6 +578,7 @@ class OpenAIServingChat(OpenAIServing):
         reasoning_parser: ReasoningParser | None = None,
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())
+        need_thinking_padding = is_enable_thinking_request(request)
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
 
@@ -1368,6 +1372,7 @@ class OpenAIServingChat(OpenAIServing):
         from vllm.tokenizers.mistral import MistralTokenizer
 
         created_time = int(time.time())
+        need_thinking_padding = is_enable_thinking_request(request)
         final_res: RequestOutput | None = None
 
         try:
@@ -1397,7 +1402,7 @@ class OpenAIServingChat(OpenAIServing):
             token_ids = output.token_ids
             out_logprobs = output.logprobs
             tool_call_info = None
-            if self.reasoning_padding and output.text is not None:
+            if need_thinking_padding and self.reasoning_padding and output.text is not None:
                 output.text = f"{self.reasoning_padding}\n{output.text}"
 
             if request.logprobs and request.top_logprobs is not None:
