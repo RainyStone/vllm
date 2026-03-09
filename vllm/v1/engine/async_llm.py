@@ -506,7 +506,15 @@ class AsyncLLM(EngineClient):
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:
-            logger.info("Added request %s.", request.request_id)
+            trace_headers = request.trace_headers
+            logger.info("Added request %s traceId: [%s], rpcId: [%s], requestId: [%s],"
+                        " otlpTraceId: [%s], appKeyId: [%s].",
+                        request.request_id,
+                        trace_headers.get("SOFA-TraceId", None) if trace_headers else None,
+                        trace_headers.get("SOFA-RpcId", None) if trace_headers else None,
+                        trace_headers.get("X-Request-ID", None) if trace_headers else None,
+                        trace_headers.get("traceparent", None) if trace_headers else None,
+                        trace_headers.get("X-AIGW-APP-KeyId", None) if trace_headers else None)
 
     async def _add_streaming_input_request(
         self,

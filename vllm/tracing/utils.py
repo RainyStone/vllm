@@ -9,7 +9,7 @@ from vllm.utils.func_utils import run_once
 logger = init_logger(__name__)
 
 # Standard W3C headers used for context propagation
-TRACE_HEADERS = ["traceparent", "tracestate"]
+TRACE_HEADERS = ["traceparent", "tracestate", "SOFA-TraceId", "SOFA-RpcId", "X-Request-ID", "X-AIGW-APP-KeyId"]
 
 
 class SpanAttributes:

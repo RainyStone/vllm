@@ -521,6 +521,7 @@ class OpenAIServing:
                 engine_prompt,
                 params=pooling_params,
                 lora_request=ctx.lora_request,
+                trace_headers=trace_headers,
             )
 
             generator = self.engine_client.encode(
@@ -535,7 +536,6 @@ class OpenAIServing:
             generators.append(generator)
 
         ctx.result_generator = merge_async_iterators(*generators)
-
         return None
 
     async def _collect_batch(
@@ -974,6 +974,7 @@ class OpenAIServing:
                 engine_prompt,
                 params=sampling_params,
                 lora_request=lora_request,
+                trace_headers=trace_headers,
             )
 
             generator = self.engine_client.generate(
@@ -1041,6 +1042,7 @@ class OpenAIServing:
         inputs: PromptType | ProcessorInputs,
         params: SamplingParams | PoolingParams | BeamSearchParams | None,
         lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> None:
         if self.request_logger is None:
             return
@@ -1054,6 +1056,7 @@ class OpenAIServing:
             components.embeds,
             params=params,
             lora_request=lora_request,
+            trace_headers=trace_headers,
         )
 
     async def _get_trace_headers(

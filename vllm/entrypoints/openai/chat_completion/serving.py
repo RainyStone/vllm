@@ -344,17 +344,18 @@ class OpenAIServingChat(OpenAIServing):
                         self.default_sampling_params,
                     )
 
+                trace_headers = (
+                    None
+                    if raw_request is None
+                    else await self._get_trace_headers(raw_request.headers)
+                )
+
                 self._log_inputs(
                     sub_request_id,
                     engine_prompt,
                     params=sampling_params,
                     lora_request=lora_request,
-                )
-
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
+                    trace_headers=trace_headers,
                 )
 
                 # Build metrics dict for observability

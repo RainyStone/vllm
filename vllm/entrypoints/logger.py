@@ -43,6 +43,7 @@ class RequestLogger:
         prompt_embeds: torch.Tensor | None,
         params: SamplingParams | PoolingParams | BeamSearchParams | None,
         lora_request: LoRARequest | None,
+        trace_headers: dict[str, str] | None = None,
     ) -> None:
         if logger.isEnabledFor(logging.DEBUG):
             max_log_len = self.max_log_len
@@ -55,19 +56,31 @@ class RequestLogger:
 
             logger.debug(
                 "Request %s details: prompt: %r, "
+                "traceId: [%s], rpcId: [%s], requestId: [%s], otlpTraceId: [%s], appKeyId: [%s],"
                 "prompt_token_ids: %s, "
                 "prompt_embeds shape: %s.",
                 request_id,
                 prompt,
+                trace_headers.get("SOFA-TraceId", None) if trace_headers else None,
+                trace_headers.get("SOFA-RpcId", None) if trace_headers else None,
+                trace_headers.get("X-Request-ID", None) if trace_headers else None,
+                trace_headers.get("traceparent", None) if trace_headers else None,
+                trace_headers.get("X-AIGW-APP-KeyId", None) if trace_headers else None,
                 prompt_token_ids,
                 prompt_embeds.shape if prompt_embeds is not None else None,
             )
 
         logger.info(
-            "Received request %s: params: %s, lora_request: %s.",
+            "Received request %s: params: %s, lora_request: %s, "
+            "traceId: [%s], rpcId: [%s], requestId: [%s], otlpTraceId: [%s], appKeyId: [%s].",
             request_id,
             params,
             lora_request,
+            trace_headers.get("SOFA-TraceId", None) if trace_headers else None,
+            trace_headers.get("SOFA-RpcId", None) if trace_headers else None,
+            trace_headers.get("X-Request-ID", None) if trace_headers else None,
+            trace_headers.get("traceparent", None) if trace_headers else None,
+            trace_headers.get("X-AIGW-APP-KeyId", None) if trace_headers else None,
         )
 
     def log_outputs(
