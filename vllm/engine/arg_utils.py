@@ -620,6 +620,11 @@ class EngineArgs:
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
 
+    # domain parallel config
+    dp_per_domain: int = ParallelConfig.dp_per_domain
+    # num_cp_reqs: number of requests to be processed in a single iteration for cp.
+    num_cp_seqs: int = SchedulerConfig.num_cp_seqs
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -959,6 +964,13 @@ class EngineArgs:
             "--worker-extension-cls", **parallel_kwargs["worker_extension_cls"]
         )
 
+        # dp_per_domain
+        parallel_group.add_argument(
+            "--dp-per-domain", 
+            "-dpd",
+            **parallel_kwargs["dp_per_domain"]
+        )
+
         # KV cache arguments
         cache_kwargs = get_kwargs(CacheConfig)
         cache_group = parser.add_argument_group(
@@ -1240,6 +1252,10 @@ class EngineArgs:
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
 
+        scheduler_group.add_argument(
+            "--num-cp-seqs", **scheduler_kwargs["num_cp_seqs"]
+        )
+
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)
         compilation_group = parser.add_argument_group(
@@ -1252,6 +1268,13 @@ class EngineArgs:
         compilation_group.add_argument(
             "--max-cudagraph-capture-size",
             **compilation_kwargs["max_cudagraph_capture_size"],
+        )
+
+        # For cp tokens, the max number of cp tokens in a batch.
+        compilation_group.add_argument(
+            "--cudagraph-capture-sizes-for-cp",
+            "-cccp",
+            **compilation_kwargs["cudagraph_capture_sizes_for_cp"],
         )
 
         # Kernel arguments
@@ -1772,6 +1795,8 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
+            # domain parallel config
+            dp_per_domain=self.dp_per_domain,
         )
 
         speculative_config = self.create_speculative_config(
@@ -1806,6 +1831,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            num_cp_seqs=self.num_cp_seqs,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
