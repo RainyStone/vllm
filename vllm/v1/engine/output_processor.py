@@ -154,6 +154,7 @@ class RequestState:
         request_params: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
         metrics: Mapping[str, object] | None = None,
+        modalities: set[str] | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -182,6 +183,7 @@ class RequestState:
         self.observable_context = observable_context
         self.request_params = request_params
         self.trace_headers = trace_headers
+        self.modalities = modalities
 
         self.stats = (
             RequestStateStats(
@@ -278,6 +280,11 @@ class RequestState:
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
+        # Extract modalities from mm_features
+        modalities: set[str] | None = None
+        if request.mm_features:
+            modalities = {mm_feature.modality for mm_feature in request.mm_features}
+
         assert request.external_req_id is not None
         return cls(
             request_id=request.request_id,
@@ -304,6 +311,7 @@ class RequestState:
             request_params=gen_request_params(),
             trace_headers=trace_headers,
             metrics=request.metrics,
+            modalities=modalities,
         )
 
     def make_request_output(
@@ -903,6 +911,7 @@ class OutputProcessor:
                 ),
                 max_tokens_param=req_state.max_tokens_param,
                 req_stats=req_state.stats,
+                modalities=req_state.modalities,
             )
 
     def _update_stats_from_finished(

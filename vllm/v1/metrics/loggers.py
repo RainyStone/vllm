@@ -654,6 +654,24 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 for idx in engine_indexes
             }
 
+        # VLM request counter with modality label
+        self._counter_mm_requests_base = self._counter_cls(
+            name="vllm:mm_requests_total",
+            documentation="Count of multi-modal requests with "
+            "multimodal inputs.",
+            labelnames=labelnames + ["modality"],
+        )
+        self.counter_mm_requests: dict[str, dict[int, Counter]] = {}
+        for modality in ("image", "video", "audio", "multi"):
+            self.counter_mm_requests[modality] = {
+                idx: self._counter_mm_requests_base.labels(
+                    model_name, str(idx), modality
+                )
+                for idx in engine_indexes
+            }
+        self._mm_model_name = model_name
+        self._mm_engine_indexes = engine_indexes
+
         #
         # Histograms of counts
         #
@@ -1179,6 +1197,21 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+            # Record MM request if it has modalities
+            if finished_request.modalities:
+                modality = ("multi" if len(finished_request.modalities) > 1
+                            else next(iter(finished_request.modalities)))
+                mm_counters = self.counter_mm_requests.get(modality)
+                if mm_counters is None:
+                    # Lazily init for unexpected modality types
+                    mm_counters = {
+                        idx: self._counter_mm_requests_base.labels(
+                            self._mm_model_name, str(idx), modality
+                        )
+                        for idx in self._mm_engine_indexes
+                    }
+                    self.counter_mm_requests[modality] = mm_counters
+                mm_counters[engine_idx].inc()
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1
