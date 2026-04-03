@@ -536,6 +536,20 @@ class OpenAIServingRender:
             },
         )
 
+        if "prompt_token_ids" in engine_prompt and isinstance(request, ChatCompletionRequest):
+            prompt_token_ids = engine_prompt["prompt_token_ids"]
+            kv_transfer_params = getattr(request, "kv_transfer_params", None)
+            if kv_transfer_params is not None and kv_transfer_params.get("do_remote_prefill", False):
+                last_token_id = kv_transfer_params.get("last_token_id", None)
+                if last_token_id is None:
+                    raise ValueError(
+                        "In disaggregated prefill mode, "
+                        "kv_transfer_params must contain the 'last_token_id' key, "
+                        f"but received: {kv_transfer_params}"
+                    )
+                prompt_token_ids += [last_token_id]
+            engine_prompt["prompt_token_ids"] = prompt_token_ids
+
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
         # is set, we want to prevent parsing a tool_call hallucinated by the LLM
