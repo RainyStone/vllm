@@ -1789,7 +1789,8 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             # Fill placeholder draft tokens so spec-decode requests can match
             # CUDA graph shapes before real draft ids arrive.
-            request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
+            request.spec_token_ids = [0] * self.num_spec_tokens
+#            request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
