@@ -11,10 +11,13 @@ async def preprocess_completion_with_multi_modal(
     request: CompletionRequest,
     model_config: ModelConfig,
 ) -> list[EngineTokensPrompt]:
-    mm_data, mm_uuids = await parse_completion_multimodal_data(
-        request,
-        model_config
-    )
+    try:
+        mm_data, mm_uuids = await parse_completion_multimodal_data(
+            request,
+            model_config
+        )
+    except Exception as e:
+        raise ValueError(f"Failed to parse multimodal data: {e}") from e
 
     if mm_data is not None:
         engine_prompt["multi_modal_data"] = mm_data

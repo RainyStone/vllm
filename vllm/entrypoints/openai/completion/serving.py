@@ -166,11 +166,15 @@ class OpenAIServingCompletion(OpenAIServing):
         if request.multi_modal_data:
             logger.info("Processing multimodal data for request %s", request_id)
             assert engine_prompts[0]["prompt_token_ids"] is not None
-            engine_prompts = await preprocess_completion_with_multi_modal(
-                engine_prompt=engine_prompts[0],
-                request=request,
-                model_config=self.model_config
-            )
+            try:
+                engine_prompts = await preprocess_completion_with_multi_modal(
+                    engine_prompt=engine_prompts[0],
+                    request=request,
+                    model_config=self.model_config
+                )
+            except ValueError as e:
+                logger.exception("Error in preprocessing prompt inputs")
+                return self.create_error_response(e)
         try:
             kv_transfer_params = request.kv_transfer_params
             if kv_transfer_params is not None and \
