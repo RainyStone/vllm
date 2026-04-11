@@ -234,15 +234,18 @@ class OpenAIServingRender:
             if error_check_ret is not None:
                 return error_check_ret
 
-            conversation, engine_prompts = await self._preprocess_chat(
-                request,
-                request.messages,
-                default_template=self.chat_template,
-                default_template_content_format=self.chat_template_content_format,
-                default_template_kwargs=self.default_chat_template_kwargs,
-                tool_dicts=tool_dicts,
-                tool_parser=tool_parser,
-            )
+            try:
+                conversation, engine_prompts = await self._preprocess_chat(
+                    request,
+                    request.messages,
+                    default_template=self.chat_template,
+                    default_template_content_format=self.chat_template_content_format,
+                    default_template_kwargs=self.default_chat_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    tool_parser=tool_parser,
+                )
+            except Exception as e:
+                raise ValueError(f"Failed to preprocess inputs: {e}") from e
         else:
             # For GPT-OSS.
             should_include_tools = tool_dicts is not None
@@ -459,7 +462,10 @@ class OpenAIServingRender:
             prompts.extend(prompt_to_seq(prompt_embeds))
         if prompt_input is not None:
             prompts.extend(prompt_to_seq(prompt_input))
-        return await self._preprocess_cmpl(request, prompts)
+        try:
+            return await self._preprocess_cmpl(request, prompts)
+        except Exception as e:
+            raise ValueError(f"Failed to preprocess inputs: {e}") from e
 
     async def _preprocess_cmpl(
         self,
