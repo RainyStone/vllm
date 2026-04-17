@@ -1305,7 +1305,7 @@ class GPUModelRunner(
             # scheduling. This tracks token generation progress and maintains
             # request state. NOTE: The spec tokens are placeholders and not
             # added to token_ids_cpu.
-            if self.use_async_scheduling:
+            if self.use_async_scheduling and self.vllm_config.kv_transfer_config is not None:
                 req_state = self.requests[request.req_id]
                 spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
                     request.req_id, []

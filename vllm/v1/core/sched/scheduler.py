@@ -664,7 +664,10 @@ class Scheduler(SchedulerInterface):
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
-                    num_new_tokens = request.num_tokens_with_spec - num_computed_tokens
+                    if self.vllm_config.kv_transfer_config is not None:
+                        num_new_tokens = request.num_tokens_with_spec - num_computed_tokens
+                    else:
+                        num_new_tokens = request.num_tokens - num_computed_tokens
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -831,7 +834,7 @@ class Scheduler(SchedulerInterface):
                             self.ec_connector.update_state_after_alloc(request, i)
                     encoder_compute_budget = new_encoder_compute_budget
                 # Speculative decode related.
-                if request.spec_token_ids:
+                if request.spec_token_ids and self.vllm_config.kv_transfer_config is not None:
                     num_scheduled_spec_tokens = (
                         num_new_tokens
                         + request.num_computed_tokens
@@ -1789,8 +1792,8 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             # Fill placeholder draft tokens so spec-decode requests can match
             # CUDA graph shapes before real draft ids arrive.
-            request.spec_token_ids = [0] * self.num_spec_tokens
-#            request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
+            if self.vllm_config.kv_transfer_config is not None:
+                request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
