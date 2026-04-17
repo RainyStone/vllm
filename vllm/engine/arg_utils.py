@@ -1838,6 +1838,7 @@ class EngineArgs:
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
             num_cp_seqs=self.num_cp_seqs,
+            long_request_threshold=self.long_request_threshold,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
