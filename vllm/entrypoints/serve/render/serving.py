@@ -486,14 +486,28 @@ class OpenAIServingRender:
         ]
         tok_params = request.build_tok_params(model_config)
 
+        # Build prompt_extras with multimodal data
+        prompt_extras = {
+            k: v
+            for k in ("mm_processor_kwargs", "cache_salt")
+            if (v := getattr(request, k, None)) is not None
+        }
+
+        # Add multimodal data if present
+        if hasattr(request, "multi_modal_data") and request.multi_modal_data:
+            from vllm.entrypoints.completion_utils import parse_completion_multimodal_data
+            mm_data, mm_uuids = await parse_completion_multimodal_data(
+                request, model_config
+            )
+            if mm_data is not None:
+                prompt_extras["multi_modal_data"] = mm_data
+            if mm_uuids is not None:
+                prompt_extras["multi_modal_uuids"] = mm_uuids
+
         return await renderer.render_cmpl_async(
             parsed_prompts,
             tok_params,
-            prompt_extras={
-                k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
-                if (v := getattr(request, k, None)) is not None
-            },
+            prompt_extras=prompt_extras,
         )
 
     async def _preprocess_chat(
