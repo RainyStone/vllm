@@ -1313,23 +1313,8 @@ class EngineCoreProc(EngineCore):
                     )
             raise err
 
-    def _log_domain_error_callback(self, scheduler_outputs: list[SchedulerOutput]):
-        """Log error details of a future that's not expected to return a result."""
-
-        def callback(f, sched_outputs=scheduler_outputs):
-            with self.log_domain_error_detail(sched_outputs):
-                result = f.result()
-                assert None in result
-            return result
-
-        return callback
 
     def step_domain_with_batch_queue(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
-
-        # If paused, don't schedule any work.
-        if self._scheduler_paused:
-            return {}, False
-
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -1342,11 +1327,11 @@ class EngineCoreProc(EngineCore):
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_outputs = self.scheduler.schedule()
-
-            exec_future = self.model_executor.execute_model(
-                scheduler_outputs, non_block=True
-            )
-            if not self.is_ec_producer:
+            with self.log_domain_error_detail(scheduler_outputs):
+                exec_future = self.model_executor.execute_model(
+                    scheduler_outputs, non_block=True
+                )
+            if self.is_ec_consumer:
                 model_executed =  any([so.total_num_scheduled_tokens > 0 for so in scheduler_outputs])
 
             if self.is_pooling_model or not model_executed:
@@ -1424,11 +1409,6 @@ class EngineCoreProc(EngineCore):
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
-        # If paused, don't schedule any work.
-        if self._scheduler_paused:
-            return {}, False
-
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -1464,45 +1444,22 @@ class EngineCoreProc(EngineCore):
         logger.info(f"{'Run domain engine core !':^25}")
         logger.info("*" * 25)
 
-        # Signal handler used for graceful termination.
-        # SystemExit exception is only raised once to allow this and worker
-        # processes to terminate without error
-        shutdown_requested = False
-
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
 
-        def signal_handler(signum, frame):
-            nonlocal shutdown_requested
-            if not shutdown_requested:
-                shutdown_requested = True
-                raise SystemExit()
-
-        # Either SIGTERM or SIGINT will terminate the engine_core
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
-
         engine_core: EngineCoreProc | None = None
+        signal_callback: SignalCallback | None = None
         try:
             vllm_config: VllmConfig = kwargs["vllm_config"]
             parallel_config: ParallelConfig = vllm_config.parallel_config
             data_parallel = parallel_config.data_parallel_size // parallel_config.dp_per_domain > 1
             if data_parallel:
                 parallel_config.domain_parallel_rank_local = local_domain_rank
-                maybe_init_worker_tracer(
-                    instrumenting_module_name="vllm.engine_core",
-                    process_kind="engine_core",
-                    process_name=f"EngineCore_Domain{domain_rank}",
-                )
-                set_process_title("EngineCore", f"Domain{domain_rank}")
-                logger.info(f"Domain rank: {domain_rank}, local domain rank: {local_domain_rank}")
+                process_title = f"EngineCore_Domain{domain_rank}"
             else:
-                maybe_init_worker_tracer(
-                    instrumenting_module_name="vllm.engine_core",
-                    process_kind="engine_core",
-                    process_name="EngineCore",
-                )
-                set_process_title("EngineCore")
+                process_title = "EngineCore"
+            set_process_title(process_title)
+            maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
             decorate_logs()
 
             if data_parallel and vllm_config.kv_transfer_config is not None:
@@ -1533,6 +1490,21 @@ class EngineCoreProc(EngineCore):
 
             assert engine_core is not None
 
+            def wakeup_engine():
+                # Wakes up idle engine via input_queue when shutdown is requested
+                # Not safe in a signal handler - we may interrupt the main thread
+                # while it is holding the non-reentrant input_queue.mutex
+                engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+            signal_callback = SignalCallback(wakeup_engine)
+
+            def signal_handler(signum, frame):
+                engine_core.shutdown_state = EngineShutdownState.REQUESTED
+                signal_callback.trigger()
+
+            signal.signal(signal.SIGTERM, signal_handler)
+            signal.signal(signal.SIGINT, signal_handler)
+
             scheduler_config = kwargs["vllm_config"].scheduler_config
             engine_core.step_fn = (
                 engine_core.step_domain_with_batch_queue if scheduler_config.async_scheduling else engine_core.step_domain
@@ -1551,6 +1523,10 @@ class EngineCoreProc(EngineCore):
                 engine_core._send_engine_dead()
             raise e
         finally:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if signal_callback is not None:
+                signal_callback.stop()
             if engine_core is not None:
                 engine_core.shutdown()
 
@@ -2536,7 +2512,6 @@ class DomainEngineCoreProc(DPEngineCoreProc):
 
     # def _init_doamin_parallel
     def _init_data_parallel(self, vllm_config: VllmConfig):
-
         domain_count = vllm_config.parallel_config.data_parallel_size // vllm_config.parallel_config.dp_per_domain
         local_domain_rank = vllm_config.parallel_config.domain_parallel_rank_local
         domain_rank = vllm_config.parallel_config.domain_parallel_rank
@@ -2547,7 +2522,7 @@ class DomainEngineCoreProc(DPEngineCoreProc):
 
         self.domain_rank = domain_rank
         logger.info(f"Domain rank: {self.domain_rank} start to init statelss domain group")
-        self.domain_group = vllm_config.parallel_config.stateless_init_domain_group()
+        self.domain_group, self.domain_store = vllm_config.parallel_config.stateless_init_domain_group(return_store=True)
 
         """
         AoChen: For reusing busy loop, so we assign domain_rank to self.dp_rank
