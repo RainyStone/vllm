@@ -538,6 +538,31 @@ class SamplingParams(
                     self.stop_token_ids = list(eos_ids)
 
     def update_from_tokenizer(self, tokenizer: TokenizerLike) -> None:
+        # Convert single-token stop strings to stop_token_ids so that
+        # the scheduler can detect them at the token-ID level (in
+        # check_stop) rather than relying on the detokenizer's
+        # text-level stop-string check which runs after the scheduler
+        # has already decided the finish reason.  This prevents
+        # FINISHED_LENGTH_CAPPED from being incorrectly set when the
+        # model actually produced a stop token, which causes KV cache
+        # blocks to be delay-freed instead of immediately freed in
+        # disaggregated prefill/decode.
+        if self.stop:
+            converted = []
+            for stop_str in self.stop:
+                token_ids = tokenizer.encode(
+                    text=stop_str, add_special_tokens=False
+                )
+                if len(token_ids) == 1:
+                    token_id = token_ids[0]
+                    if token_id not in self.stop_token_ids:
+                        self.stop_token_ids.append(token_id)
+                        self._all_stop_token_ids.add(token_id)
+                        converted.append((stop_str, token_id))
+            if converted:
+                logger.info(
+                    "Converted single-token stop strings to stop_token_ids: %s", converted)
+
         if not self.bad_words:
             return
         self._bad_words_token_ids = []
