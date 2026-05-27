@@ -248,9 +248,13 @@ def parse_chat_input_to_harmony_message(
             commentary_msg = commentary_msg.with_channel("commentary")
             msgs.append(commentary_msg)
 
-        reasoning = chat_msg.get("reasoning")
-        if reasoning:
-            analysis_msg = Message.from_role_and_content(Role.ASSISTANT, reasoning)
+        reasoning_content = chat_msg.get("reasoning") or chat_msg.get(
+            "reasoning_content"
+        )
+        if reasoning_content:
+            analysis_msg = Message.from_role_and_content(
+                Role.ASSISTANT, reasoning_content
+            )
             analysis_msg = analysis_msg.with_channel("analysis")
             msgs.append(analysis_msg)
 
@@ -285,9 +289,9 @@ def parse_chat_input_to_harmony_message(
         return [msg]
 
     # Non-tool reasoning content
-    reasoning = chat_msg.get("reasoning")
-    if role == "assistant" and reasoning:
-        analysis_msg = Message.from_role_and_content(Role.ASSISTANT, reasoning)
+    reasoning_content = chat_msg.get("reasoning") or chat_msg.get("reasoning_content")
+    if role == "assistant" and reasoning_content:
+        analysis_msg = Message.from_role_and_content(Role.ASSISTANT, reasoning_content)
         analysis_msg = analysis_msg.with_channel("analysis")
         msgs.append(analysis_msg)
 

@@ -287,8 +287,18 @@ class ExtractedToolCallInformation(BaseModel):
 class DeltaMessage(OpenAIBaseModel):
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = None
+    reasoning: str | None = Field(default=None, exclude=True)
+    reasoning_content: str | None = None
+    """Legacy vLLM reasoning field exposed by the Chat Completions API."""
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def populate_reasoning_content(self):
+        if self.reasoning is None and self.reasoning_content is not None:
+            self.reasoning = self.reasoning_content
+        elif self.reasoning is not None:
+            self.reasoning_content = self.reasoning
+        return self
 
 
 class GenerationError(Exception):

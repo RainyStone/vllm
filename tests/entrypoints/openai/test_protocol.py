@@ -4,6 +4,8 @@ from openai_harmony import (
     Message,
 )
 
+from vllm.entrypoints.openai.chat_completion.protocol import ChatMessage
+from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.entrypoints.openai.responses.protocol import (
     serialize_message,
     serialize_messages,
@@ -37,3 +39,25 @@ def test_serialize_messages() -> None:
     }
     msg = Message.from_dict(msg_value)
     assert serialize_messages([msg, dict_value]) == [msg_value, dict_value]
+
+
+def test_chat_reasoning_serializes_as_reasoning_content() -> None:
+    message = ChatMessage(role="assistant", reasoning="thinking", content="answer")
+
+    message_json = message.model_dump(exclude_unset=True, exclude_none=True)
+
+    assert message.reasoning == "thinking"
+    assert message.reasoning_content == "thinking"
+    assert message_json["reasoning_content"] == "thinking"
+    assert "reasoning" not in message_json
+
+
+def test_delta_reasoning_serializes_as_reasoning_content() -> None:
+    delta = DeltaMessage(reasoning="thinking")
+
+    delta_json = delta.model_dump(exclude_unset=True, exclude_none=True)
+
+    assert delta.reasoning == "thinking"
+    assert delta.reasoning_content == "thinking"
+    assert delta_json["reasoning_content"] == "thinking"
+    assert "reasoning" not in delta_json
