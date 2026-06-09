@@ -39,6 +39,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
     get_dcp_group,
+    get_dycp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -434,6 +435,9 @@ class GPUModelRunner(
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
+        self.cp_world_size = self.parallel_config.dycp_size
+        self.cp_rank = 0 if self.cp_world_size <= 1 else get_dycp_group().rank_in_group
+
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping micro-batches
@@ -662,6 +666,10 @@ class GPUModelRunner(
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+        if self.cp_world_size > 1:
+            self.dycp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
         # Because inputs_embeds may be bfloat16 and we don't need a numpy
@@ -985,6 +993,8 @@ class GPUModelRunner(
                 scheduler_output,
                 decode_threshold=self.reorder_batch_threshold,
             )
+        if scheduler_output.num_cp_request > 0:
+            pass  # CP requests handled via index-based gather; no reorder needed
 
     def _init_kv_zero_meta(self) -> None:
         """One-time precomputation for _zero_block_ids.
@@ -1488,6 +1498,12 @@ class GPUModelRunner(
         # Equivalent to but faster than:
         # np.concatenate([np.arange(n) for n in num_tokens])
         """
+        # When a batch contains a mix of DCP requests and normal requests,
+        # it is possible for either dcp_tokens or normal_tokens to be empty.
+        # when num_tokens is empty, return empty arrays
+        if len(num_tokens) == 0:
+            return np.array([]), np.array([])
+
         # Step 1. [2, 5, 3] -> [2, 7, 10]
         cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
         total_num_tokens = cu_num_tokens[-1]
@@ -1777,7 +1793,13 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+        if self.cp_world_size > 1:
+            cp_req_indices = self._compute_cp_req_indices(scheduler_output) or []
+            self.input_batch.block_table.compute_slot_mapping_with_dycp(
+                req_indices, positions_np, cp_req_indices
+            )
+        else:
+            self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
@@ -1883,6 +1905,19 @@ class GPUModelRunner(
             spec_decode_metadata,
         )
 
+    def _compute_cp_req_indices(
+            self, scheduler_output: "SchedulerOutput"
+    ) -> list[int] | None:
+        """Compute CP request indices in input_batch order."""
+        if not scheduler_output.cp_req_ids_sorted:
+            return None
+        indices = []
+        for req_id in scheduler_output.cp_req_ids_sorted:
+            idx = self.input_batch.req_id_to_index.get(req_id)
+            if idx is not None:
+                indices.append(idx)
+        return indices if indices else None
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -1897,6 +1932,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        cp_req_indices: list[int] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1973,6 +2009,7 @@ class GPUModelRunner(
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
+            cp_req_indices=cp_req_indices,
         )
 
         if self.dcp_world_size > 1:
@@ -1989,6 +2026,30 @@ class GPUModelRunner(
             cm_base.dcp_local_seq_lens_cpu = self.dcp_local_seq_lens.cpu[
                 :num_reqs_padded
             ]
+
+        if self.cp_world_size > 1:
+            # Default: copy all seq_lens as-is.
+            self.dycp_local_seq_lens.cpu[:num_reqs].copy_(
+                self.seq_lens.cpu[:num_reqs]
+            )
+            # Override CP request entries with local token counts.
+            if cp_req_indices:
+                cp_idx_tensor = torch.tensor(
+                    cp_req_indices, dtype=torch.long
+                )
+                cp_seq_lens = self.seq_lens.cpu[cp_idx_tensor]
+                local_cp_lens = get_dcp_local_seq_lens(
+                    cp_seq_lens,
+                    self.cp_world_size,
+                    self.cp_rank,
+                    self.parallel_config.cp_kv_cache_interleave_size,
+                )
+                self.dycp_local_seq_lens.cpu[cp_idx_tensor] = local_cp_lens
+            self.dycp_local_seq_lens.cpu[num_reqs:].fill_(0)
+            self.dycp_local_seq_lens.copy_to_gpu(num_reqs_padded)
+
+            cm_base.dycp_local_seq_lens = self.dycp_local_seq_lens.gpu[:num_reqs_padded]
+            cm_base.dycp_local_seq_lens_cpu = self.dycp_local_seq_lens.cpu[:num_reqs_padded]
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -3323,6 +3384,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        num_dycp_reqs: int = 0,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3359,6 +3421,7 @@ class GPUModelRunner(
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
+                num_dycp_reqs=num_dycp_reqs,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
@@ -3650,6 +3713,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                num_dycp_reqs=scheduler_output.num_cp_request,
             )
 
             logger.debug(
@@ -3732,6 +3796,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    cp_req_indices=self._compute_cp_req_indices(scheduler_output),
                 )
             )
 
@@ -4951,6 +5016,7 @@ class GPUModelRunner(
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        num_dycp_reqs: int = 0,
         profile_seq_lens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -5064,6 +5130,7 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                num_dycp_reqs=num_dycp_reqs,
             )
         )
 
@@ -6110,8 +6177,10 @@ class GPUModelRunner(
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.compilation_config.cudagraph_mode = cudagraph_mode
+        # When cp_world_size > 1, dycp is enabled; worst case all reqs are cp reqs
+        max_dycp_reqs = self.scheduler_config.num_cp_seqs if self.cp_world_size > 1 else 0
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, self.uniform_decode_query_len, num_dycp_reqs=max_dycp_reqs
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.

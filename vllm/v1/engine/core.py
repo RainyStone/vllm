@@ -29,6 +29,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
+from vllm.utils.func_utils import supports_kw
 from vllm.utils.gc_utils import (
     freeze_gc_heap,
     maybe_attach_gc_debug_callback,
@@ -138,7 +139,7 @@ class EngineCore:
             * vllm_config.parallel_config.prefill_context_parallel_size
         )
 
-        self.scheduler: SchedulerInterface = Scheduler(
+        scheduler_kwargs = dict(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
             structured_output_manager=self.structured_output_manager,
@@ -146,6 +147,12 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
+        # CPAwareScheduler (but not base Scheduler) accepts dp_group for
+        # distributed CP sync. Pass it only when the scheduler class supports it
+        # to avoid breaking other scheduler implementations.
+        if supports_kw(Scheduler.__init__, "dp_group"):
+            scheduler_kwargs["dp_group"] = getattr(self, "dp_group", None)
+        self.scheduler: SchedulerInterface = Scheduler(**scheduler_kwargs)
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
@@ -385,8 +392,16 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
+            # Even with no local requests, CP sync all_reduce must still
+            # execute so that peer ranks with active CP requests are not
+            # blocked waiting for this rank to participate.
+            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+                from vllm.v1.core.sched.output import SchedulerOutput
+                self.scheduler.post_schedule_cp_sync(SchedulerOutput.make_empty())
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+            scheduler_output = self.scheduler.post_schedule_cp_sync(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -445,6 +460,8 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+                scheduler_output = self.scheduler.post_schedule_cp_sync(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -482,7 +499,14 @@ class EngineCore:
                     # or there are no more requests to schedule.
                     return None, True
 
-        elif not batch_queue:
+        else:
+            # No local requests, but CP sync all_reduce must still participate
+            # so peer ranks with active CP requests are not blocked.
+            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+                from vllm.v1.core.sched.output import SchedulerOutput
+                self.scheduler.post_schedule_cp_sync(SchedulerOutput.make_empty())
+
+        if not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.

@@ -333,6 +333,9 @@ class ParallelConfig:
     """Equal to the data parallel rank but not used for torch process groups
     and not overridden for dense models."""
 
+    dycp_size: int = Field(default=1, ge=1)
+    """Number of DP ranks per CP group (DYCP context parallel world size)."""
+
     _api_process_count: int = Field(default=1, gt=0)
     """
     The number of API processes initialized.
