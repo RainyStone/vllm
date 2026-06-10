@@ -1009,44 +1009,130 @@ class FlashAttentionImpl(AttentionImpl):
             cp_cu_seqlens_q[1:] = cp_query_lens.cumsum(0).to(torch.int32)
             cp_max_seqlen_q = int(cp_query_lens.max().item())
 
-            # seqused_k: local KV lengths for CP requests
-            cp_seqused_k = attn_metadata.dycp_local_seq_lens[cp_req_tensor]
-            cp_max_seqlen_k = int(cp_seqused_k.max().item())
+            # local KV counts for all CP requests (full, including this step)
+            cp_local_seq_lens = attn_metadata.dycp_local_seq_lens[cp_req_tensor]
+
+            # Per-request count of KV tokens written by this rank in the
+            # current step.  This is the interleave-partitioned share of the
+            # query tokens that this rank is responsible for storing.
+            cp_query_lens_cpu = cp_query_lens.cpu()
+            local_step_kv = get_dcp_local_seq_lens(
+                cp_query_lens_cpu,
+                self.dycp_world_size,
+                self.dycp_rank,
+                self.cp_kv_cache_interleave_size,
+            ).to(device=query.device, dtype=cp_local_seq_lens.dtype)
+
+            # History KV = total local KV minus what was just written this step.
+            # context attention (causal=False) only sees tokens prior to this step.
+            cp_context_seqused_k = (cp_local_seq_lens - local_step_kv).clamp(min=0)
+
+            is_prefill = (cp_query_lens > 1)  # per-request prefill flag
+            any_prefill = bool(is_prefill.any().item())
 
             # block_table rows for CP requests
             cp_block_table = attn_metadata.block_table[cp_req_tensor]
 
-            # Each rank attends to its local KV partition with the full query.
-            cp_attn_out, cp_lse = flash_attn_varlen_func(
-                q=cp_query,
-                k=key_cache,
-                v=value_cache,
-                out=None,
-                cu_seqlens_q=cp_cu_seqlens_q,
-                max_seqlen_q=cp_max_seqlen_q,
-                seqused_k=cp_seqused_k,
-                max_seqlen_k=cp_max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=False,
-                alibi_slopes=self.alibi_slopes,
-                window_size=sliding_window_size,
-                block_table=cp_block_table,
-                softcap=self.logits_soft_cap,
-                return_softmax_lse=True,
-                fa_version=self.vllm_flash_attn_version,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-            )
-            # FA returns LSE as [H, T_cp]; cp_lse_ag_out_ar expects [T_cp, H].
-            # Use all_reduce (not reduce_scatter): DYCP does not shard heads,
-            # so every rank needs the full [T_cp, H, D] result.
-            cp_final = cp_lse_ag_out_ar(
-                cp_attn_out,
-                cp_lse.transpose(0, 1),
-                get_dycp_group(),
-            )
-            output[cp_token_idx] = cp_final
+            cp_context_max_k = int(cp_context_seqused_k.max().item())
+            has_context = cp_context_max_k > 0
+
+            if has_context:
+                cp_context_attn_out, cp_context_lse = flash_attn_varlen_func(
+                    q=cp_query,
+                    k=key_cache,
+                    v=value_cache,
+                    out=None,
+                    cu_seqlens_q=cp_cu_seqlens_q,
+                    max_seqlen_q=cp_max_seqlen_q,
+                    seqused_k=cp_context_seqused_k,
+                    max_seqlen_k=cp_context_max_k,
+                    softmax_scale=self.scale,
+                    causal=False,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=cp_block_table,
+                    softcap=self.logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                # All-reduce across DYCP ranks to merge each rank's context result.
+                # Returns (out, lse) with lse in [T_cp, H] form.
+                cp_context_out_cor, cp_context_lse_cor = cp_lse_ag_out_ar(
+                    cp_context_attn_out,
+                    cp_context_lse.transpose(0, 1),
+                    get_dycp_group(),
+                    return_lse=True,
+                )
+
+            if not any_prefill:
+                # Pure-decode batch: context attention covers all KV.
+                assert has_context
+                output[cp_token_idx] = cp_context_out_cor
+            else:
+                # At least one prefill CP request: run local causal self-attention
+                # over the current-step key/value, then merge with context result.
+                cp_key = key[cp_token_idx].contiguous()
+                cp_value = value[cp_token_idx].contiguous()
+                cp_local_attn_out, cp_local_lse = flash_attn_varlen_func(
+                    q=cp_query,
+                    k=cp_key,
+                    v=cp_value,
+                    out=None,
+                    cu_seqlens_q=cp_cu_seqlens_q,
+                    max_seqlen_q=cp_max_seqlen_q,
+                    cu_seqlens_k=cp_cu_seqlens_q,
+                    max_seqlen_k=cp_max_seqlen_q,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    softcap=self.logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                # local lse from FA is [H, T_cp]; merge_attn_states wants [T_cp, H].
+                cp_local_lse_t = cp_local_lse.transpose(0, 1).contiguous()
+
+                if not has_context:
+                    # First prefill step: no history KV at all, local causal only.
+                    output[cp_token_idx] = cp_local_attn_out
+                elif is_prefill.all():
+                    # All CP requests are prefill — merge context + local for all.
+                    cp_merged = torch.empty_like(cp_query)
+                    merge_attn_states(
+                        cp_merged,
+                        cp_context_out_cor,
+                        cp_context_lse_cor,
+                        cp_local_attn_out,
+                        cp_local_lse_t,
+                    )
+                    output[cp_token_idx] = cp_merged
+                else:
+                    # Mixed prefill + decode CP requests in the same batch.
+                    # Prefill: merge context + local.  Decode: context only.
+                    token_is_prefill = torch.repeat_interleave(
+                        is_prefill, cp_query_lens.to(torch.long)
+                    )
+                    cp_merged = torch.empty_like(cp_query)
+                    merge_attn_states(
+                        cp_merged,
+                        cp_context_out_cor,
+                        cp_context_lse_cor,
+                        cp_local_attn_out,
+                        cp_local_lse_t,
+                    )
+                    prefill_tok = cp_token_idx[token_is_prefill]
+                    decode_tok = cp_token_idx[~token_is_prefill]
+                    local_prefill = torch.where(token_is_prefill)[0]
+                    local_decode = torch.where(~token_is_prefill)[0]
+                    output[prefill_tok] = cp_merged[local_prefill]
+                    output[decode_tok] = cp_context_out_cor[local_decode]
 
         # --- Step 3: non-CP tokens — standard causal attention ---
         if non_cp_token_idx.numel() > 0:
