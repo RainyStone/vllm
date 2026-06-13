@@ -1110,8 +1110,9 @@ class OpenAIServing:
     ) -> tuple[list[FunctionCall] | None, str | None]:
         function_calls = list[FunctionCall]()
         if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
-            assert content is not None
-            # Forced Function Call
+            # Forced Function Call (Responses API)
+            if content is None:
+                return [], None
             function_calls.append(
                 FunctionCall(name=request.tool_choice.name, arguments=content)
             )
@@ -1119,7 +1120,9 @@ class OpenAIServing:
         elif request.tool_choice and isinstance(
             request.tool_choice, ChatCompletionNamedToolChoiceParam
         ):
-            assert content is not None
+            # Named function with standard JSON-based parsing
+            if content is None:
+                return [], None
             # Forced Function Call
             function_calls.append(
                 FunctionCall(name=request.tool_choice.function.name, arguments=content)
