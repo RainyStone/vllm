@@ -75,6 +75,8 @@ class CPAwareScheduler(Scheduler):
             log_stats=log_stats,
         )
 
+        logger.info("Using CPAwareScheduler.")
+
         self.cp_world_size = vllm_config.parallel_config.dycp_size
         self.cp_rank = (
             vllm_config.parallel_config.data_parallel_rank % self.cp_world_size
@@ -127,6 +129,7 @@ class CPAwareScheduler(Scheduler):
         else:
             # Client guarantees CP requests are broadcast to all ranks, so
             # activate immediately without a pending/announce phase.
+            logger.debug("[DYCP Debug] Long request detected.")
             request.cp_ranks = list(range(self.cp_world_size))
             self.active_cp_requests[request.request_id] = request
             self.requests[request.request_id] = request
@@ -218,10 +221,10 @@ class CPAwareScheduler(Scheduler):
                 s = NOT_SCHEDULED
                 s_str = "NOT_SCHEDULED"
             req = self.active_cp_requests[req_id]
-            logger.info(
-                "[Debug] CP sync rank=%d req=%s local_status=%s "
+            logger.debug(
+                "[DYCP Debug] CP sync rank=%d req=%s local_status=%s "
                 "num_computed=%d in_requests=%s",
-                self.cp_rank, req_id[:8], s_str,
+                self.cp_rank, req_id, s_str,
                 req.num_computed_tokens, req_id in self.requests,
             )
             status.append(s)
@@ -236,7 +239,7 @@ class CPAwareScheduler(Scheduler):
             self.prev_step_scheduled_req_ids.discard(req_id)
             if req is not None:
                 logger.info(
-                    "[Debug] CP request %s removed from active_cp_requests"
+                    "[DYCP Debug] CP request %s removed from active_cp_requests"
                     " on rank %d (finished, peer notified via SCHEDULED)",
                     req_id, self.cp_rank,
                 )
@@ -273,12 +276,12 @@ class CPAwareScheduler(Scheduler):
                 self.active_cp_requests.pop(req_id, None)
                 self.prev_step_scheduled_req_ids.discard(req_id)
                 continue
-
+            logger.debug(f"[DYCP Debug] Soft rollback triggered for req {req_id}.")
             if req_id in output.num_scheduled_tokens:
-                logger.info(
-                    "[Debug] Soft rollback req=%s (was SCHEDULED on this rank,"
+                logger.debug(
+                    "[DYCP Debug] Soft rollback req=%s (was SCHEDULED on this rank,"
                     " num_computed=%d)",
-                    req_id[:8],
+                    req_id,
                     self.active_cp_requests[req_id].num_computed_tokens,
                 )
                 num_tokens = output.num_scheduled_tokens.pop(req_id)
@@ -304,10 +307,10 @@ class CPAwareScheduler(Scheduler):
                     self.running.remove(request)
                 self.waiting.prepend_request(request)
             else:
-                logger.info(
-                    "[Debug] Soft rollback req=%s (was NOT_SCHEDULED on this"
+                logger.debug(
+                    "[DYCP Debug] Soft rollback req=%s (was NOT_SCHEDULED on this"
                     " rank, num_computed=%d, in_running=%s, in_waiting=%s)",
-                    req_id[:8],
+                    req_id,
                     self.active_cp_requests[req_id].num_computed_tokens,
                     self.active_cp_requests[req_id] in self.running,
                     self.active_cp_requests[req_id] in self.waiting,
@@ -332,7 +335,7 @@ class CPAwareScheduler(Scheduler):
                 self.active_cp_requests.pop(req_id, None)
                 self.prev_step_scheduled_req_ids.discard(req_id)
                 continue
-
+            logger.debug(f"[DYCP Debug] Hard rollback triggered for req {req_id}.")
             if req_id in output.num_scheduled_tokens:
                 num_tokens = output.num_scheduled_tokens.pop(req_id)
                 output.total_num_scheduled_tokens -= num_tokens
