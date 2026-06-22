@@ -392,16 +392,8 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            # Even with no local requests, CP sync all_reduce must still
-            # execute so that peer ranks with active CP requests are not
-            # blocked waiting for this rank to participate.
-            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
-                from vllm.v1.core.sched.output import SchedulerOutput
-                self.scheduler.post_schedule_cp_sync(SchedulerOutput.make_empty())
             return {}, False
         scheduler_output = self.scheduler.schedule()
-        if hasattr(self.scheduler, 'post_schedule_cp_sync'):
-            scheduler_output = self.scheduler.post_schedule_cp_sync(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -460,8 +452,6 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
-                scheduler_output = self.scheduler.post_schedule_cp_sync(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -499,14 +489,7 @@ class EngineCore:
                     # or there are no more requests to schedule.
                     return None, True
 
-        else:
-            # No local requests, but CP sync all_reduce must still participate
-            # so peer ranks with active CP requests are not blocked.
-            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
-                from vllm.v1.core.sched.output import SchedulerOutput
-                self.scheduler.post_schedule_cp_sync(SchedulerOutput.make_empty())
-
-        if not batch_queue:
+        elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.

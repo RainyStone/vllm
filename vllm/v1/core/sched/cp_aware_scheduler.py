@@ -4,7 +4,7 @@
 
 Extends the existing Scheduler with CP awareness while preserving the
 per-DP independent process architecture. CP requests are coordinated
-via CPSyncProtocol.
+via a post-schedule all-reduce MIN consensus protocol.
 
 Design rationale: the client layer (DPEngineCoreClient) broadcasts CP requests
 to ALL DP ranks before they reach the scheduler, so every rank is guaranteed to
@@ -16,15 +16,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+import torch.distributed
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.v1.core.sched.cp_sync import (
-    NOT_SCHEDULED,
-    PREEMPTED,
-    SCHEDULED,
-    CPSyncProtocol,
-)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
@@ -37,6 +34,119 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
 logger = init_logger(__name__)
+
+# Maximum number of CP requests that can be synced in one round.
+_MAX_CP_SYNC_SLOTS = 32
+
+# Three-state encoding for post-schedule consensus.
+SCHEDULED = 2
+NOT_SCHEDULED = 1
+PREEMPTED = 0
+
+
+class CPSyncProtocol:
+    """Post-schedule consensus protocol for CP request scheduling.
+
+    Uses the existing dp_group all-reduce MIN to agree on whether each active
+    CP request was successfully scheduled on ALL ranks in the current step.
+
+    Three-state encoding per request:
+        SCHEDULED (2)     - this rank scheduled the request
+        NOT_SCHEDULED (1) - this rank did not schedule it (budget exhausted)
+        PREEMPTED (0)     - this rank preempted it (KV cache eviction)
+
+    After all-reduce MIN:
+        min >= SCHEDULED  -> confirmed: execute on all ranks
+        min >= NOT_SCHEDULED -> soft rollback: re-queue without resetting KV
+        min == PREEMPTED  -> hard rollback: all ranks evict and reset
+    """
+
+    def __init__(
+        self,
+        dp_group: "ProcessGroup",
+        cp_world_size: int,
+        cp_rank: int,
+    ):
+        self.dp_group = dp_group
+        self.cp_world_size = cp_world_size
+        self.cp_rank = cp_rank
+
+        # Pre-allocated tensor for post-schedule all-reduce (avoids per-call
+        # allocation on the hot path).
+        self._confirm_tensor = torch.zeros(
+            _MAX_CP_SYNC_SLOTS, dtype=torch.int32, device="cpu"
+        )
+
+    def sync_schedule_confirm(
+        self,
+        active_ids: list[str],
+        status: list[int],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Post-schedule consensus using three-state encoding.
+
+        Args:
+            active_ids: Active CP request IDs (sorted, identical across ranks).
+            status: Per-request status on this rank
+                    (SCHEDULED=2 / NOT_SCHEDULED=1 / PREEMPTED=0).
+
+        Returns:
+            (confirmed_ids, soft_rollback_ids, hard_rollback_ids)
+        """
+        num_slots = min(len(active_ids), _MAX_CP_SYNC_SLOTS)
+        if num_slots == 0:
+            return [], [], []
+
+        self._confirm_tensor.zero_()
+        for i in range(num_slots):
+            self._confirm_tensor[i] = status[i]
+
+        torch.distributed.all_reduce(
+            self._confirm_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.dp_group,
+        )
+
+        confirmed: list[str] = []
+        soft_rollback: list[str] = []
+        hard_rollback: list[str] = []
+        for i in range(num_slots):
+            val = self._confirm_tensor[i].item()
+            if val >= SCHEDULED:
+                confirmed.append(active_ids[i])
+            elif val >= NOT_SCHEDULED:
+                soft_rollback.append(active_ids[i])
+            else:
+                hard_rollback.append(active_ids[i])
+
+        if soft_rollback or hard_rollback:
+            logger.debug(
+                "CP confirm: confirmed=%d soft_rollback=%d hard_rollback=%d"
+                " on rank %d",
+                len(confirmed),
+                len(soft_rollback),
+                len(hard_rollback),
+                self.cp_rank,
+            )
+
+        return confirmed, soft_rollback, hard_rollback
+
+    def sync_empty(self) -> None:
+        """Participate in the sync all_reduce with no active CP requests.
+
+        Called by ranks that have no active CP requests in a given step so
+        that peer ranks which do have active requests are not blocked waiting
+        for all participants in the collective operation.
+
+        Fills the tensor with NOT_SCHEDULED (1) so that the MIN operation does
+        not drive any active slot down to PREEMPTED (0), which would trigger
+        spurious hard-rollbacks on the peer ranks.
+        """
+        self._confirm_tensor.fill_(NOT_SCHEDULED)
+        torch.distributed.all_reduce(
+            self._confirm_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.dp_group,
+        )
 
 
 class CPAwareScheduler(Scheduler):
@@ -148,66 +258,67 @@ class CPAwareScheduler(Scheduler):
         super()._preempt_request(request, timestamp)
 
     # ------------------------------------------------------------------
-    # Schedule override: add CP metadata to output
+    # has_requests override
+    # ------------------------------------------------------------------
+
+    def has_requests(self) -> bool:
+        # Active CP requests require this rank to participate in the all_reduce
+        # even when it has no locally-scheduled tokens, so treat them as
+        # "requests to handle" from core.py's perspective.
+        return super().has_requests() or bool(self.active_cp_requests)
+
+    # ------------------------------------------------------------------
+    # Schedule override: local scheduling + distributed CP consensus
     # ------------------------------------------------------------------
 
     def schedule(self) -> SchedulerOutput:
-        """Schedule requests, adding CP metadata to output."""
+        """Schedule requests and run the distributed CP consensus in one step.
+
+        When cp_sync is active this method performs:
+          1. super().schedule() — local scheduling as usual
+          2. Annotate output with CP metadata
+          3. all_reduce MIN — agree on confirmed / rollback decisions
+          4. Apply rollbacks and finalise cp_req_ids_sorted
+        """
         self._preempted_this_step.clear()
         output = super().schedule()
 
-        # Annotate output with CP metadata.
+        # Annotate output with CP metadata (needed by workers regardless of sync).
         output.cp_rank = self.cp_rank
-
-        # Count CP requests and build metadata.
         cp_req_ids: list[str] = []
         req_id_to_cp_size: dict[str, list[int]] = {}
-
         for req_id in output.num_scheduled_tokens:
             if req_id in self.active_cp_requests:
-                request = self.active_cp_requests[req_id]
                 cp_req_ids.append(req_id)
-                req_id_to_cp_size[req_id] = request.cp_ranks
-
+                req_id_to_cp_size[req_id] = self.active_cp_requests[req_id].cp_ranks
         output.num_cp_request = len(cp_req_ids)
         output.cp_rank_to_req_id = cp_req_ids if cp_req_ids else None
         output.req_id_to_cp_size = req_id_to_cp_size if req_id_to_cp_size else None
-
-        # For CP requests, adjust scheduled tokens to local portion.
         if output.cp_rank_scheduled_tokens is None:
             output.cp_rank_scheduled_tokens = {}
         for req_id in cp_req_ids:
             output.cp_rank_scheduled_tokens[req_id] = self.cp_world_size
 
-        return output
-
-    # ------------------------------------------------------------------
-    # Post-schedule CP sync: consensus based on actual schedule result
-    # ------------------------------------------------------------------
-
-    def post_schedule_cp_sync(self, output: SchedulerOutput) -> SchedulerOutput:
-        """Post-schedule sync: consensus on actual scheduling results."""
+        # No sync needed (single DP or test environment without dp_group).
         if self.cp_sync is None:
             self._preempted_this_step.clear()
             return output
 
-        # Always participate in the all_reduce even when this rank has no active
-        # CP requests, so peer ranks with active CP requests are not blocked.
+        # Participate in the all_reduce even when this rank has no active CP
+        # requests so peer ranks are not blocked waiting for this participant.
         if not self.active_cp_requests:
             self.cp_sync.sync_empty()
             self._preempted_this_step.clear()
             return output
 
+        # Build per-request status vector for the all_reduce.
         active_ids = sorted(self.active_cp_requests.keys())
-
         status: list[int] = []
         finished_ids: list[str] = []
         for req_id in active_ids:
             if req_id not in self.requests:
-                # This rank already finished the request. Report SCHEDULED so
-                # the peer rank is not blocked by a spurious NOT_SCHEDULED/MIN,
-                # allowing it to continue decode independently until it finishes.
-                # Clean up after the sync.
+                # This rank already finished; report SCHEDULED so the peer is
+                # not held back. Clean up after the sync.
                 s = SCHEDULED
                 s_str = "FINISHED(report SCHEDULED)"
                 finished_ids.append(req_id)
@@ -251,14 +362,10 @@ class CPAwareScheduler(Scheduler):
 
         self._preempted_this_step.clear()
 
-        # Pass sorted confirmed CP req IDs to workers for index computation.
-        if confirmed:
-            output.cp_req_ids_sorted = sorted(confirmed)
-        else:
-            output.cp_req_ids_sorted = None
+        output.cp_req_ids_sorted = sorted(confirmed) if confirmed else None
 
-        # If this rank has no tokens to execute but peer ranks do have CP
-        # tokens, signal workers to run a dummy forward pass for collective ops.
+        # Signal workers to run a dummy forward for collective ops when this
+        # rank has no tokens but peer ranks have confirmed CP tokens.
         if output.total_num_scheduled_tokens == 0 and confirmed:
             output.none_tokens_in_peer_sched = True
 
@@ -414,7 +521,7 @@ class CPAwareScheduler(Scheduler):
         result = super().update_from_output(scheduler_output, model_runner_output)
 
         # Do NOT clean up active_cp_requests here. Removal is handled in
-        # post_schedule_cp_sync once we detect req_id not in self.requests.
+        # schedule() once we detect req_id not in self.requests.
         # Removing here would make active_ids diverge between ranks on the
         # next step (one rank finishes a step earlier), causing slot mismatches
         # in the all-reduce and breaking the sync protocol.
