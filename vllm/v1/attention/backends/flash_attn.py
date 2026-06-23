@@ -22,7 +22,7 @@ from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
@@ -40,7 +40,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_dycp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -227,6 +227,12 @@ class FlashAttentionMetadata:
     max_dcp_context_kv_len: int | None = None
     dcp_context_kv_lens: torch.Tensor | None = None
 
+    # For DYCP: indices of CP requests in the batch (request dimension).
+    cp_req_indices: list[int] | None = None
+    # For DYCP: per-request local KV lengths (full seq_len for non-CP,
+    # local portion for CP requests).
+    dycp_local_seq_lens: torch.Tensor | None = None
+
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -315,6 +321,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+
+        try:
+            from vllm.distributed.parallel_state import get_dycp_group
+
+            self.dycp_world_size = get_dycp_group().world_size
+            self.dycp_rank = get_dycp_group().rank_in_group
+        except AssertionError:
+            self.dycp_world_size = 1
+            self.dycp_rank = 0
 
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size
@@ -524,6 +539,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
             dcp_context_kv_lens=dcp_context_kv_lens,
+            cp_req_indices=common_attn_metadata.cp_req_indices,
+            dycp_local_seq_lens=common_attn_metadata.dycp_local_seq_lens,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             scheduler_metadata=scheduler_metadata,
@@ -734,6 +751,20 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=v_descale,
                 )
                 return output
+            elif attn_metadata.cp_req_indices:
+                self._forward_with_dycp(
+                    query[:num_actual_tokens],
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    attn_metadata,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                return output
             else:
                 sliding_window_size = (
                     list(self.sliding_window)
@@ -915,6 +946,242 @@ class FlashAttentionImpl(AttentionImpl):
             query_attn_out,
             query_lse,
         )
+
+    def _forward_with_dycp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        q_descale: torch.Tensor | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+    ) -> None:
+        """Forward pass for batches containing DYCP (dynamic CP) requests.
+        CP requests use cross-rank attention (all_gather + flash_attn +
+        cp_lse_ag_out_rs). Non-CP requests use standard causal attention.
+        """
+        assert attn_metadata.cp_req_indices is not None
+        assert attn_metadata.dycp_local_seq_lens is not None
+
+        cp_req_indices = attn_metadata.cp_req_indices
+        query_start_loc = attn_metadata.query_start_loc  # [num_reqs + 1]
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else None
+        )
+
+        # --- Step 1: compute CP and non-CP token indices ---
+        cp_token_idx_list: list[int] = []
+        for req_idx in cp_req_indices:
+            start = query_start_loc[req_idx].item()
+            end = query_start_loc[req_idx + 1].item()
+            cp_token_idx_list.extend(range(start, end))
+
+        num_actual_tokens = query.shape[0]
+        all_token_idx = set(range(num_actual_tokens))
+        cp_token_set = set(cp_token_idx_list)
+        non_cp_token_idx_list = sorted(all_token_idx - cp_token_set)
+
+        cp_token_idx = torch.tensor(
+            cp_token_idx_list, dtype=torch.long, device=query.device
+        )
+        non_cp_token_idx = torch.tensor(
+            non_cp_token_idx_list, dtype=torch.long, device=query.device
+        )
+
+        # --- Step 2: CP tokens — cross-rank attention ---
+        if cp_token_idx.numel() > 0:
+            cp_query = query[cp_token_idx].contiguous()  # [T_cp, H, D]
+
+            # Build cu_seqlens_q for CP requests only
+            cp_req_tensor = torch.tensor(
+                cp_req_indices, dtype=torch.long, device=query.device
+            )
+            cp_query_lens = (
+                    query_start_loc[cp_req_tensor + 1] - query_start_loc[cp_req_tensor]
+            )
+            cp_cu_seqlens_q = torch.zeros(
+                len(cp_req_indices) + 1, dtype=torch.int32, device=query.device
+            )
+            cp_cu_seqlens_q[1:] = cp_query_lens.cumsum(0).to(torch.int32)
+            cp_max_seqlen_q = int(cp_query_lens.max().item())
+
+            # local KV counts for all CP requests (full, including this step)
+            cp_local_seq_lens = attn_metadata.dycp_local_seq_lens[cp_req_tensor]
+
+            # Per-request count of KV tokens written by this rank in the
+            # current step.  This is the interleave-partitioned share of the
+            # query tokens that this rank is responsible for storing.
+            cp_query_lens_cpu = cp_query_lens.cpu()
+            local_step_kv = get_dcp_local_seq_lens(
+                cp_query_lens_cpu,
+                self.dycp_world_size,
+                self.dycp_rank,
+                self.cp_kv_cache_interleave_size,
+            ).to(device=query.device, dtype=cp_local_seq_lens.dtype)
+
+            # History KV = total local KV minus what was just written this step.
+            # context attention (causal=False) only sees tokens prior to this step.
+            cp_context_seqused_k = (cp_local_seq_lens - local_step_kv).clamp(min=0)
+
+            is_prefill = (cp_query_lens > 1)  # per-request prefill flag
+            any_prefill = bool(is_prefill.any().item())
+
+            # block_table rows for CP requests
+            cp_block_table = attn_metadata.block_table[cp_req_tensor]
+
+            cp_context_max_k = int(cp_context_seqused_k.max().item())
+            has_context = cp_context_max_k > 0
+
+            if has_context:
+                cp_context_attn_out, cp_context_lse = flash_attn_varlen_func(
+                    q=cp_query,
+                    k=key_cache,
+                    v=value_cache,
+                    out=None,
+                    cu_seqlens_q=cp_cu_seqlens_q,
+                    max_seqlen_q=cp_max_seqlen_q,
+                    seqused_k=cp_context_seqused_k,
+                    max_seqlen_k=cp_context_max_k,
+                    softmax_scale=self.scale,
+                    causal=False,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=cp_block_table,
+                    softcap=self.logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                # All-reduce across DYCP ranks to merge each rank's context result.
+                # Returns (out, lse) with lse in [T_cp, H] form.
+                cp_context_out_cor, cp_context_lse_cor = cp_lse_ag_out_ar(
+                    cp_context_attn_out,
+                    cp_context_lse.transpose(0, 1),
+                    get_dycp_group(),
+                    return_lse=True,
+                )
+
+            if not any_prefill:
+                # Pure-decode batch: context attention covers all KV.
+                assert has_context
+                output[cp_token_idx] = cp_context_out_cor
+            else:
+                # At least one prefill CP request: run local causal self-attention
+                # over the current-step key/value, then merge with context result.
+                cp_key = key[cp_token_idx].contiguous()
+                cp_value = value[cp_token_idx].contiguous()
+                cp_local_attn_out, cp_local_lse = flash_attn_varlen_func(
+                    q=cp_query,
+                    k=cp_key,
+                    v=cp_value,
+                    out=None,
+                    cu_seqlens_q=cp_cu_seqlens_q,
+                    max_seqlen_q=cp_max_seqlen_q,
+                    cu_seqlens_k=cp_cu_seqlens_q,
+                    max_seqlen_k=cp_max_seqlen_q,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    softcap=self.logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                # local lse from FA is [H, T_cp]; merge_attn_states wants [T_cp, H].
+                cp_local_lse_t = cp_local_lse.transpose(0, 1).contiguous()
+
+                if not has_context:
+                    # First prefill step: no history KV at all, local causal only.
+                    output[cp_token_idx] = cp_local_attn_out
+                elif is_prefill.all():
+                    # All CP requests are prefill — merge context + local for all.
+                    cp_merged = torch.empty_like(cp_query)
+                    merge_attn_states(
+                        cp_merged,
+                        cp_context_out_cor,
+                        cp_context_lse_cor,
+                        cp_local_attn_out,
+                        cp_local_lse_t,
+                    )
+                    output[cp_token_idx] = cp_merged
+                else:
+                    # Mixed prefill + decode CP requests in the same batch.
+                    # Prefill: merge context + local.  Decode: context only.
+                    token_is_prefill = torch.repeat_interleave(
+                        is_prefill, cp_query_lens.to(torch.long)
+                    )
+                    cp_merged = torch.empty_like(cp_query)
+                    merge_attn_states(
+                        cp_merged,
+                        cp_context_out_cor,
+                        cp_context_lse_cor,
+                        cp_local_attn_out,
+                        cp_local_lse_t,
+                    )
+                    prefill_tok = cp_token_idx[token_is_prefill]
+                    decode_tok = cp_token_idx[~token_is_prefill]
+                    local_prefill = torch.where(token_is_prefill)[0]
+                    local_decode = torch.where(~token_is_prefill)[0]
+                    output[prefill_tok] = cp_merged[local_prefill]
+                    output[decode_tok] = cp_context_out_cor[local_decode]
+
+        # --- Step 3: non-CP tokens — standard causal attention ---
+        if non_cp_token_idx.numel() > 0:
+            # Identify which request indices are non-CP
+            cp_req_set_tensor = torch.tensor(
+                cp_req_indices, dtype=torch.long, device=query.device
+            )
+            num_reqs = query_start_loc.shape[0] - 1
+            all_req_mask = torch.ones(num_reqs, dtype=torch.bool, device=query.device)
+            all_req_mask[cp_req_set_tensor] = False
+            non_cp_req_indices = torch.where(all_req_mask)[0]
+
+            non_cp_query_lens = (
+                    query_start_loc[non_cp_req_indices + 1]
+                    - query_start_loc[non_cp_req_indices]
+            )
+            non_cp_cu_seqlens_q = torch.zeros(
+                non_cp_req_indices.shape[0] + 1,
+                dtype=torch.int32,
+                device=query.device,
+            )
+            non_cp_cu_seqlens_q[1:] = non_cp_query_lens.cumsum(0).to(torch.int32)
+            non_cp_max_seqlen_q = int(non_cp_query_lens.max().item())
+
+            non_cp_seqused_k = attn_metadata.seq_lens[non_cp_req_indices]
+            non_cp_max_seqlen_k = int(non_cp_seqused_k.max().item())
+            non_cp_block_table = attn_metadata.block_table[non_cp_req_indices]
+
+            non_cp_out = flash_attn_varlen_func(
+                q=query[non_cp_token_idx],
+                k=key_cache,
+                v=value_cache,
+                out=None,
+                cu_seqlens_q=non_cp_cu_seqlens_q,
+                max_seqlen_q=non_cp_max_seqlen_q,
+                seqused_k=non_cp_seqused_k,
+                max_seqlen_k=non_cp_max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=non_cp_block_table,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            output[non_cp_token_idx] = non_cp_out
 
     def _forward_encoder_attention(
         self,

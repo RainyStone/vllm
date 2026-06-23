@@ -226,6 +226,7 @@ class Worker(WorkerBase):
                 not in ("ray", "external_launcher")
                 and parallel_config.data_parallel_backend != "ray"
                 and parallel_config.nnodes_within_dp == 1
+                and parallel_config.dycp_size == 1
             ):
                 # Use local DP rank if available, otherwise use global DP rank.
                 dp_local_rank = self.parallel_config.data_parallel_rank_local
@@ -768,6 +769,9 @@ class Worker(WorkerBase):
                 handle.wait()
             self._pp_send_work = []
 
+        if (scheduler_output.total_num_scheduled_tokens == 0
+                and scheduler_output.none_tokens_in_peer_sched):
+            self.model_runner._dummy_run(1, uniform_decode=True)
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
