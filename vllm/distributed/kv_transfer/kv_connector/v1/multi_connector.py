@@ -33,6 +33,7 @@ from vllm.v1.outputs import KVConnectorOutput
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -219,6 +220,10 @@ class MultiConnector(KVConnectorBase_V1):
         for c in self._connectors:
             c.register_kv_caches(kv_caches)
 
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        for c in self._connectors:
+            c.bind_gpu_block_pool(gpu_block_pool)
+
     # We must override the base class method here because we need to bind
     # the metadata to each connector in the order of the connectors in the
     # MultiKVConnectorMetadata.
@@ -315,10 +320,11 @@ class MultiConnector(KVConnectorBase_V1):
         for c in self._connectors:
             c.set_host_xfer_buffer_ops(copy_operation)
 
-    def handle_preemptions(self, preempted_req_ids: set[str]):
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         """Handle preempted requests for all sub-connectors."""
-        for c in self._connectors:
-            c.handle_preemptions(preempted_req_ids)
+        assert isinstance(kv_connector_metadata, MultiKVConnectorMetadata)
+        for c, cm in zip(self._connectors, kv_connector_metadata.metadata):
+            c.handle_preemptions(cm)
 
     def get_finished_count(self) -> int | None:
         # TODO(https://github.com/vllm-project/vllm/issues/33400)

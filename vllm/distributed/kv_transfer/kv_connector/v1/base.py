@@ -62,6 +62,7 @@ if TYPE_CHECKING:
         PromMetricT,
     )
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -288,9 +289,9 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
-    def handle_preemptions(self, preempted_req_ids: set[str]):
+    def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         """
-        Handle preempted requests BEFORE their blocks are overwritten.
+        Handle preempted requests or evicted blocks BEFORE they are overwritten.
         Needed for connectors which use async saves (e.g., OffloadingConnector)
         """
         return
@@ -445,6 +446,15 @@ class KVConnectorBase_V1(ABC):
     # ==============================
     # Scheduler-side methods
     # ==============================
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        """
+        Bind the GPU block pool to the connector for per-GPU block status tracking.
+
+        Args:
+            gpu_block_pool: the GPU block pool.
+        """
+        return
 
     @abstractmethod
     def get_num_new_matched_tokens(
