@@ -788,6 +788,39 @@ class SamplingParams(
             and self.structured_outputs.grammar.strip() == ""
         ):
             raise ValueError("structured_outputs.grammar cannot be an empty string")
+        # Reject empty string json schema early to avoid engine-side crashes.
+        # `get_structured_output_key` checks `is not None`, so an empty string
+        # would otherwise reach `compile_json_schema("")` and crash EngineCore.
+        if (
+            isinstance(self.structured_outputs.json, str)
+            and self.structured_outputs.json.strip() == ""
+        ):
+            raise ValueError("structured_outputs.json cannot be an empty string")
+        # Reject empty string regex early. xgrammar tolerates compile_regex("")
+        # without crashing, but an empty regex provides no constraint and is a
+        # degenerate request; reject at the API layer for consistency.
+        if (
+            isinstance(self.structured_outputs.regex, str)
+            and self.structured_outputs.regex.strip() == ""
+        ):
+            raise ValueError("structured_outputs.regex cannot be an empty string")
+        # Reject empty string structural_tag early (same crash path via
+        # json.loads("") in compile_grammar).
+        if (
+            isinstance(self.structured_outputs.structural_tag, str)
+            and self.structured_outputs.structural_tag.strip() == ""
+        ):
+            raise ValueError(
+                "structured_outputs.structural_tag cannot be an empty string"
+            )
+        # Reject json_object=False early: it passes the exclusivity check but
+        # resolves to no structured-output key, so it must be rejected here
+        # (-> 400) instead of reaching and crashing the engine.
+        if self.structured_outputs.json_object is False:
+            raise ValueError(
+                "structured_outputs.json_object must be True if set; omit "
+                "structured_outputs to disable structured outputs"
+            )
 
         from vllm.v1.structured_output.backend_guidance import (
             has_guidance_unsupported_json_features,
