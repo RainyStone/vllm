@@ -2462,7 +2462,10 @@ class EngineArgs:
                 usage_context.value if usage_context else None,
             )
 
-        if self.num_cp_seqs > 0:
+
+        # Docode Node don't support CP prefill， so the CP chunk buffer is unnecessary
+        kv_role = getattr(self.kv_transfer_config, "kv_role", None)
+        if kv_role == 'kv_producer':
             # TODO [DyCP] 如果都是长请求，这样放大没问题，但是如果都是短请求，由于短请求不走CP，这样会有问题
             # 不放大的话可能会浪费算力，要想准确的话，需要同步修改CPAwareScheduler
             self.max_num_batched_tokens = self.max_num_batched_tokens * self.dycp_size
