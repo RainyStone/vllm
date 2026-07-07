@@ -187,6 +187,8 @@ class Request:
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
 
+        self.cp_ranks: list[int] = []
+
     @classmethod
     def from_engine_core_request(
         cls,

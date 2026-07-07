@@ -392,6 +392,13 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    dycp_local_seq_lens: torch.Tensor | None = None
+    dycp_local_seq_lens_cpu: torch.Tensor | None = None
+    """Sequence lengths of the local rank in dynamic context parallelism world"""
+
+    num_dycp_reqs: int = 0
+    """Number of DyCP (domain context parallelism) requests in the batch"""
+
     positions: torch.Tensor | None = None
     """(num_actual_tokens,) token positions.  Optional; set when the caller
     has positions available so that builders can pre-compute position-dependent
@@ -413,6 +420,10 @@ class CommonAttentionMetadata:
     _num_computed_tokens_cpu: torch.Tensor | None = None
 
     _num_computed_tokens_cache: torch.Tensor | None = None
+
+    # @property
+    # def num_dycp_reqs(self) -> int:
+    #     return len(self.cp_req_indices) if self.cp_req_indices else 0
 
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
@@ -490,6 +501,9 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            num_dycp_reqs=self.num_dycp_reqs,
+            dycp_local_seq_lens=maybe_slice_reqs(self.dycp_local_seq_lens),
+            dycp_local_seq_lens_cpu=maybe_slice_reqs(self.dycp_local_seq_lens_cpu),
         )
 
 

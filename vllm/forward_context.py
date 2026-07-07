@@ -57,6 +57,11 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    
+    num_dycp_reqs: int = 0
+    """
+    For dycp_reqs in the batch.
+    """
 
 
 def _compute_sp_num_tokens(

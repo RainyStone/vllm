@@ -1289,6 +1289,12 @@ def get_pcp_group() -> GroupCoordinator:
     assert _PCP is not None, "prefill context parallel group is not initialized"
     return _PCP
 
+_DYCP: GroupCoordinator | None = None
+
+
+def get_dycp_group() -> GroupCoordinator:
+    assert _DYCP is not None, "Dynamic context parallel group is not initialized"
+    return _DYCP
 
 @contextmanager
 def graph_capture(device: torch.device):
@@ -1719,6 +1725,25 @@ def initialize_model_parallel(
                 )
     # If no EP group needed, _EP remains None
     # If no EPLB group needed, _EPLB remains None
+
+    # Build the dycp model-parallel groups.
+    global _DYCP
+    assert _DYCP is None, "Dynamic CP model parallel group is already initialized"
+    dycp_size = config.parallel_config.dycp_size
+    assert data_parallel_size % dycp_size == 0, (
+        f"[DYCP] dycp_size ({dycp_size}) must divide data_parallel_size "
+        f"({data_parallel_size}): DyCP splits each DP group into "
+        f"data_parallel_size // dycp_size CP sub-groups."
+    )
+    group_ranks = all_ranks.transpose(1, 4)
+    dycp_group_ranks = group_ranks.reshape(-1, dycp_size).unbind(0)
+    dycp_groups = [x.tolist() for x in dycp_group_ranks]
+    _DYCP = init_model_parallel_group(
+        dycp_groups,
+        get_world_group().local_rank,
+        backend,
+        group_name="dycp",
+    )
 
     logger.info_once(
         "rank %s in world size %s is assigned as "

@@ -214,6 +214,9 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # scheduled_tokens of each cp rank
+    cp_rank_scheduled_tokens: dict[str, int] | None = None
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
@@ -235,6 +238,20 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    cp_rank: int = 0
+
+    num_cp_request: int = 0
+
+    req_id_to_cp_size: dict[str, list[int]] | None = None # TODO [DyCP] 根据CPAwareScheduler代码来看，这个变量应该是记录长请求分配到哪些cp rank了，是否重命名成 req_id_to_cp_ranks 较好？？？？
+
+    # req_ids will be processed in this cp rank
+    cp_rank_to_req_id: list[str] | None = None
+
+    none_tokens_in_peer_sched: bool = False
+
+    # # Sorted active CP request IDs; workers use this to compute batch indices.
+    # cp_req_ids_sorted: list[str] | None = None
+
     # Block IDs freshly allocated from the pool during this scheduling step.
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
@@ -252,6 +269,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            cp_rank_scheduled_tokens={},
         )
 
 

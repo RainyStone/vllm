@@ -365,6 +365,9 @@ class ParallelConfig:
         should only be set by API server scale-out.
     """
 
+    dycp_size: int = Field(default=1, ge=1)
+    """Number of DP ranks per CP group (DYCP context parallel world size)."""
+
     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:

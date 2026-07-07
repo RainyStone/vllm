@@ -3,7 +3,7 @@
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group, get_dycp_group
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -55,4 +55,10 @@ def get_total_cp_world_size():
     except AssertionError:
         # DCP might not be initialized in testing
         dcp_world_size = 1
-    return dcp_world_size * pcp_world_size
+
+    try:
+        dycp_world_size = get_dycp_group().world_size
+    except AssertionError:
+        dycp_world_size = 1
+    
+    return dcp_world_size * pcp_world_size * dycp_world_size

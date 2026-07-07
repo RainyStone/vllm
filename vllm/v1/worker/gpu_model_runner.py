@@ -38,6 +38,7 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
+    get_dycp_group,
     get_dcp_group,
     get_pp_group,
     get_tp_group,
@@ -134,6 +135,7 @@ from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
+    reorder_batch_to_split_cp_and_normal,
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -448,6 +450,9 @@ class GPUModelRunner(
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
 
+        self.cp_world_size = self.parallel_config.dycp_size
+        self.cp_rank = 0 if self.cp_world_size <= 1 else get_dycp_group().rank_in_group
+
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping micro-batches
@@ -716,6 +721,12 @@ class GPUModelRunner(
             self.dcp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
+
+        if self.cp_world_size > 1:
+            self.dycp_local_seq_lens = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+
         # Because inputs_embeds may be bfloat16 and we don't need a numpy
         # version of this tensor, avoid a RuntimeError by not creating a
         # numpy buffer.
@@ -1031,6 +1042,12 @@ class GPUModelRunner(
                 self.input_batch,
                 scheduler_output,
                 decode_threshold=self.reorder_batch_threshold,
+            )
+
+        if scheduler_output.num_cp_request > 0:
+            reorder_batch_to_split_cp_and_normal(
+                self.input_batch,
+                scheduler_output,
             )
 
     def _init_kv_zero_meta(self) -> None:
@@ -1609,6 +1626,12 @@ class GPUModelRunner(
         Equivalent to but faster than:
         np.concatenate([np.arange(n) for n in num_tokens])
         """
+        # When a batch contains a mix of DCP requests and normal requests,
+        # it is possible for either dcp_tokens or normal_tokens to be empty.
+        # when num_tokens is empty, return empty arrays
+        if len(num_tokens) == 0:
+            return np.array([])
+        
         # Step 1. [2, 5, 3] -> [2, 7, 10]
         cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
         total_num_tokens = cu_num_tokens[-1]
@@ -2033,6 +2056,7 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
+        # TODO [DyCP] 这里GPU侧暂未把针对DyCP的slot_mapping计算迁移过来，NPU侧已经迁移了针对DyCP的slot_mapping计算
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
@@ -2137,6 +2161,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        num_dycp_reqs: int = 0,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2220,6 +2245,7 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            num_dycp_reqs=num_dycp_reqs,
         )
 
         if self.dcp_world_size > 1:
@@ -2234,6 +2260,22 @@ class GPUModelRunner(
 
             cm_base.dcp_local_seq_lens = self.dcp_local_seq_lens.gpu[:num_reqs_padded]
             cm_base.dcp_local_seq_lens_cpu = self.dcp_local_seq_lens.cpu[
+                :num_reqs_padded
+            ]
+
+        if self.cp_world_size > 1:
+            self.dycp_local_seq_lens.cpu[:num_dycp_reqs] = get_dcp_local_seq_lens(
+                self.seq_lens.cpu[:num_dycp_reqs], # TODO [DyCP] self.seq_lens的数据类型从v0.18.0到v0.21.0应该是变了
+                self.cp_world_size,
+                self.cp_rank,
+                self.parallel_config.cp_kv_cache_interleave_size,
+            )
+            self.dycp_local_seq_lens.cpu[num_dycp_reqs:num_reqs].copy_(self.seq_lens.cpu[num_dycp_reqs:num_reqs]) # TODO [DyCP] self.seq_lens的数据类型从v0.18.0到v0.21.0应该是变了
+            self.dycp_local_seq_lens.cpu[num_reqs:].fill_(0)
+            self.dycp_local_seq_lens.copy_to_gpu(num_reqs_padded)
+
+            cm_base.dycp_local_seq_lens = self.dycp_local_seq_lens.gpu[:num_reqs_padded]
+            cm_base.dycp_local_seq_lens_cpu = self.dycp_local_seq_lens.cpu[
                 :num_reqs_padded
             ]
 
@@ -3633,6 +3675,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        num_dycp_reqs: int = 0,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3671,6 +3714,7 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                num_dycp_reqs=num_dycp_reqs,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -3966,6 +4010,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                num_dycp_reqs=scheduler_output.num_cp_request,
             )
 
             logger.debug(
@@ -4062,6 +4107,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    num_dycp_reqs=scheduler_output.num_cp_request,
                 )
             )
 
@@ -5341,6 +5387,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        num_dycp_reqs: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5453,6 +5500,7 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                num_dycp_reqs=num_dycp_reqs,
             )
         )
 
@@ -5542,6 +5590,7 @@ class GPUModelRunner(
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
+                    num_dycp_reqs=num_dycp_reqs,
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -6269,6 +6318,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                num_dycp_reqs=desc.num_dycp_reqs,
             )
         self._dummy_run(
             desc.num_tokens,
@@ -6280,6 +6330,7 @@ class GPUModelRunner(
             num_active_loras=desc.num_active_loras,
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
+            num_dycp_reqs=desc.num_dycp_reqs,
         )
 
     def _capture_cudagraphs(
@@ -6491,8 +6542,10 @@ class GPUModelRunner(
         )
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
+        # When cp_world_size > 1, dycp is enabled; worst case all reqs are cp reqs
+        max_dycp_reqs = self.scheduler_config.num_cp_seqs if self.cp_world_size > 1 else 0
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, self.uniform_decode_query_len, num_dycp_reqs=max_dycp_reqs
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.

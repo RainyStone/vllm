@@ -39,6 +39,7 @@ from vllm.utils.gc_utils import (
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.utils.func_utils import supports_kw
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -142,7 +143,7 @@ class EngineCore:
             kv_cache_config, vllm_config
         )
 
-        self.scheduler: SchedulerInterface = Scheduler(
+        scheduler_kwargs = dict(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
             structured_output_manager=self.structured_output_manager,
@@ -151,6 +152,14 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+
+        # CPAwareScheduler (but not base Scheduler) accepts dp_group for
+        # distributed CP sync. Pass it only when the scheduler class supports it
+        # to avoid breaking other scheduler implementations.
+        if supports_kw(Scheduler.__init__, "dp_group"):
+            scheduler_kwargs["dp_group"] = getattr(self, "dp_group", None)  # TODO [DyCP] self 是否有 dp_group 属性？？？？
+        self.scheduler: SchedulerInterface = Scheduler(**scheduler_kwargs)
+
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
