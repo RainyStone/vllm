@@ -170,6 +170,7 @@ class CPAwareScheduler(Scheduler):
         kv_cache_config: KVCacheConfig,
         structured_output_manager: StructuredOutputManager,
         block_size: int,
+        hash_block_size: int | None = None,
         dp_group: "ProcessGroup | None" = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
@@ -237,6 +238,9 @@ class CPAwareScheduler(Scheduler):
         """Add request, routing CP requests directly to active state."""
         if self.cp_world_size <= 1 or not self._is_long_request(request):
             request.cp_ranks = [self.cp_rank]
+
+            logger.info(f"[DYCP] Test: Add short request 添加短请求: {request.request_id}.....")
+
             super().add_request(request)
         else:
             # Client guarantees CP requests are broadcast to all ranks, so
@@ -284,7 +288,12 @@ class CPAwareScheduler(Scheduler):
           4. Apply rollbacks and finalise cp_req_ids_sorted
         """
         self._preempted_this_step.clear()
+
+        logger.info(f"[DYCP] Test: 00000000000.....")
+
         output = super().schedule()
+
+        logger.info(f"[DYCP] Test: 11111111111.....")
 
         # Annotate output with CP metadata (needed by workers regardless of sync).
         output.cp_rank = self.cp_rank
@@ -292,6 +301,7 @@ class CPAwareScheduler(Scheduler):
         req_id_to_cp_size: dict[str, list[int]] = {}
         for req_id in output.num_scheduled_tokens:
             if req_id in self.active_cp_requests:
+                logger.info(f"[DYCP] Test: scheduler 进入长序列处理逻辑.....")
                 cp_req_ids.append(req_id)
                 req_id_to_cp_size[req_id] = self.active_cp_requests[req_id].cp_ranks
         output.num_cp_request = len(cp_req_ids)
@@ -300,22 +310,30 @@ class CPAwareScheduler(Scheduler):
         if output.cp_rank_scheduled_tokens is None:
             output.cp_rank_scheduled_tokens = {}
 
+        logger.info(f"[DYCP] Test: 22222222222.....")
+
         cp_req_set = set(cp_req_ids)
         for req_id in output.num_scheduled_tokens:
             output.cp_rank_scheduled_tokens[req_id] = (self.cp_world_size if req_id in cp_req_set else 1) # TODO [DyCP] 从变量定义来看，应该是记录该CP rank上对每个长请求调度的token数，为什么赋值是cp_world_size？还是变量命名有误？
             # output.cp_rank_scheduled_tokens[req_id] = self.cp_world_size 
+
+        logger.info(f"[DYCP] Test: 3333333333.....")
 
         # No sync needed (single DP or test environment without dp_group).
         if self.cp_sync is None:
             self._preempted_this_step.clear()
             return output
 
-        # Participate in the all_reduce even when this rank has no active CP
-        # requests so peer ranks are not blocked waiting for this participant.
+        logger.info(f"[DYCP] Test: 4444444444.....")
+
         if not self.active_cp_requests:
-            self.cp_sync.sync_empty()
+            logger.info(f"[DYCP] Test: 44433333.....")
+            # self.cp_sync.sync_empty()
+            logger.info(f"[DYCP] Test: 444222222.....")
             self._preempted_this_step.clear()
             return output
+
+        logger.info(f"[DYCP] Test: 555555555555.....")
 
         # Build per-request status vector for the all_reduce.
         active_ids = sorted(self.active_cp_requests.keys())
@@ -350,6 +368,8 @@ class CPAwareScheduler(Scheduler):
             self.cp_sync.sync_schedule_confirm(active_ids, status)
         )
 
+        logger.info(f"[DYCP] Test: 66666666666.....")
+
         # Clean up requests that finished on this rank before the sync.
         for req_id in finished_ids:
             req = self.active_cp_requests.pop(req_id, None)
@@ -374,6 +394,9 @@ class CPAwareScheduler(Scheduler):
         # rank has no tokens but peer ranks have confirmed CP tokens.
         if output.total_num_scheduled_tokens == 0 and confirmed:
             output.none_tokens_in_peer_sched = True   # TODO [DyCP] 这里为什么这样？？？？
+
+
+        logger.info(f"[DYCP] Test: 44444444: CPAwareScheduler调度结束.....")
 
         return output
     

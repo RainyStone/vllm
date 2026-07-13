@@ -263,6 +263,7 @@ def set_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
+    num_dycp_reqs: int = 0, # TODO [DyCP] 该参数可以去掉，实际没用到，调用处也要去掉传入
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
