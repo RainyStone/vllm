@@ -602,7 +602,7 @@ class CPAwareScheduler(Scheduler):
             if suppressed:
                 # Non-owner CP rank: muted the CP request's token/finish output;
                 # cp_rank 0 of this subgroup is the sole emitter.
-                logger.debug(
+                logger.info(
                     "[DYCP] cp_rank=%d (non-owner) suppressed CP outputs for "
                     "req_ids=%s this step.",
                     self.cp_rank, sorted(cp_req_ids),

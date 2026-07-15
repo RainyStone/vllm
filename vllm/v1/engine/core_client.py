@@ -1340,6 +1340,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # Track CP request IDs so aborts can be broadcast to all engines.
         self.cp_request_ids: set[str] = set()
+        # CP request -> the DyCP subgroup (group index) that owns it, so aborts
+        # and finish tracking target the right subgroup under load balancing.
+        self.cp_req_to_group: dict[str, int] = {}
 
         super().__init__(
             vllm_config,
@@ -1356,6 +1359,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+
+        # Number of DyCP subgroups. Engines are in DP-rank order, so subgroup g
+        # is core_engines[g*cp_world_size : (g+1)*cp_world_size].
+        self.num_cp_groups = (
+            len(self.core_engines) // self.cp_world_size
+            if self.cp_world_size > 0 else 0
+        )
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
@@ -1378,6 +1388,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 if score < min_score:
                     min_score = score
                     eng_index = idx
+            logger.info(
+                "[DYCP] short request %s LB: per-engine scores = %s "
+                "(score = waiting*4 + running); chose engine idx=%d "
+                "(score=%d).",
+                request.request_id,
+                [
+                    (idx, {
+                        "waiting": current_counts[idx][0],
+                        "running": current_counts[idx][1],
+                        "score": current_counts[idx][0] * 4
+                                 + current_counts[idx][1],
+                    })
+                    for idx in range(num_engines)
+                ],
+                eng_index, min_score,
+            )
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count
@@ -1395,6 +1421,49 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             return False
         return len(request.prompt_token_ids) >= self.long_request_threshold
 
+    def _cp_group_member_indices(self, group_idx: int) -> range:
+        """Engine indices of DyCP subgroup ``group_idx``."""
+        base = group_idx * self.cp_world_size
+        return range(base, base + self.cp_world_size)
+
+    def _cp_group_score(self, group_idx: int) -> int:
+        """Load score of a DyCP subgroup = summed (waiting*4 + running) over its
+        member engines. A CP request occupies the whole subgroup cooperatively
+        (members also run short requests concurrently), so the group's total
+        load best reflects how busy it is."""
+        waiting = running = 0
+        for i in self._cp_group_member_indices(group_idx):
+            w, r = self.lb_engines[i]
+            waiting += w
+            running += r
+        return waiting * 4 + running
+
+    def _select_cp_group(self) -> int:
+        """Pick the least-loaded DyCP subgroup for a new CP request."""
+        best_g, best_score = 0, sys.maxsize
+        # Per-group breakdown for debugging: group score and the (waiting,
+        # running) of each member engine that the score is summed from.
+        breakdown = []
+        for g in range(self.num_cp_groups):
+            score = self._cp_group_score(g)
+            members = [
+                (i, {
+                    "waiting": self.lb_engines[i][0],
+                    "running": self.lb_engines[i][1],
+                })
+                for i in self._cp_group_member_indices(g)
+            ]
+            breakdown.append((g, {"score": score, "members": members}))
+            if score < best_score:
+                best_score, best_g = score, g
+        logger.info(
+            "[DYCP] CP request LB: per-subgroup breakdown = %s "
+            "(group score = sum(waiting*4 + running) over members); "
+            "chose subgroup %d (score=%d).",
+            breakdown, best_g, best_score,
+        )
+        return best_g
+
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         """Override to broadcast CP requests to all engines."""
         self._ensure_stats_update_task()
@@ -1406,11 +1475,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # CP request: route to a single DyCP subgroup (the `dycp_size`
             # adjacent engines that cooperatively decode it), NOT all engines.
             # Engines are in DP-rank order, so subgroup g is
-            # core_engines[g*dycp_size : (g+1)*dycp_size].
-            #
-            # TODO [DyCP] select the subgroup by load balancing (e.g. least
-            # loaded CP subgroup) instead of always pinning to subgroup 0.
-            cp_group = self.core_engines[: self.cp_world_size]
+            # core_engines[g*cp_world_size : (g+1)*cp_world_size].
+            cp_group_idx = self._select_cp_group()
+            cp_group = self.core_engines[
+                cp_group_idx * self.cp_world_size:
+                (cp_group_idx + 1) * self.cp_world_size
+            ]
             awaitables = []
             for engine in cp_group:
                 awaitables.append(
@@ -1421,14 +1491,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # the request's output stream (see CPAwareScheduler output merge).
             owner_engine = cp_group[0]
             logger.info(
-                "[DYCP] CP request %s routed to DyCP subgroup 0 "
-                "(engines=%s, cp_world_size=%d); owner/sole-emitter=%s.",
-                request.request_id, list(cp_group), self.cp_world_size,
+                "[DYCP] CP request %s routed to DyCP subgroup %d "
+                "(engines=%s, cp_world_size=%d, score=%d); "
+                "owner/sole-emitter=%s.",
+                request.request_id, cp_group_idx, list(cp_group),
+                self.cp_world_size, self._cp_group_score(cp_group_idx),
                 owner_engine,
             )
+            # Optimistic load bump for the whole group so the next CP request
+            # (before the next ~100ms stats refresh) sees this group as busier.
+            # Mirrors the short-request LB convention (lb_engines[idx][0] += ...).
+            for i in self._cp_group_member_indices(cp_group_idx):
+                self.lb_engines[i][0] += self.client_count
             # Track as CP request for abort routing.
             self.reqs_in_flight[request.request_id] = owner_engine
             self.cp_request_ids.add(request.request_id)
+            self.cp_req_to_group[request.request_id] = cp_group_idx
             if not self.engines_running:
                 req_msg = msgspec.msgpack.encode(
                     ("FIRST_REQ", owner_engine)
@@ -1468,6 +1546,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
                 self.cp_request_ids.discard(req_id)
+                self.cp_req_to_group.pop(req_id, None)
 
     @staticmethod
     async def eep_process_engine_core_notification(
@@ -1539,11 +1618,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # Fast-path common case.
             if engine := self.reqs_in_flight.get(req_id):
                 if req_id in self.cp_request_ids:
-                    # CP requests live on a single DyCP subgroup; abort only it.
-                    # TODO [DyCP] when subgroup selection becomes load-based,
-                    # derive the owning subgroup from reqs_in_flight instead of
-                    # pinning to subgroup 0 (core_engines[:cp_world_size]).
-                    for eng in self.core_engines[: self.cp_world_size]:
+                    # CP requests live on a single DyCP subgroup; abort only
+                    # the subgroup that owns this request.
+                    g = self.cp_req_to_group.get(req_id, 0)
+                    grp = self.core_engines[
+                        g * self.cp_world_size:
+                        (g + 1) * self.cp_world_size
+                    ]
+                    for eng in grp:
                         await self._abort_requests([req_id], eng)
                 else:
                     await self._abort_requests(request_ids, engine)
@@ -1559,10 +1641,18 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     by_engine[engine].append(req_id)
 
         if cp_ids:
-            # CP requests live on a single DyCP subgroup; abort only it.
-            # TODO [DyCP] see note above re. load-based subgroup selection.
-            for eng in self.core_engines[: self.cp_world_size]:
-                await self._abort_requests(cp_ids, eng)
+            # CP requests may be spread across subgroups; aggregate by the
+            # subgroup each request belongs to and abort only those subgroups.
+            by_group: defaultdict[int, list[str]] = defaultdict(list)
+            for req_id in cp_ids:
+                by_group[self.cp_req_to_group.get(req_id, 0)].append(req_id)
+            for g, ids in by_group.items():
+                grp = self.core_engines[
+                    g * self.cp_world_size:
+                    (g + 1) * self.cp_world_size
+                ]
+                for eng in grp:
+                    await self._abort_requests(ids, eng)
                 
         for engine, req_ids in by_engine.items():
             await self._abort_requests(req_ids, engine)
