@@ -222,6 +222,9 @@ class CPAwareScheduler(Scheduler):
     def _is_long_request(self, request: Request) -> bool:
         """Classify request as long (CP) based on prefill token count."""
         num_prefill_tokens = request.num_tokens - request.num_output_tokens
+
+        logger.info(f"[DYCP] Test: request.num_tokens={request.num_tokens}, request.num_output_tokens={request.num_output_tokens}, num_prefill_tokens={num_prefill_tokens}, self.long_request_threshold={self.long_request_threshold} .....")
+
         return num_prefill_tokens >= self.long_request_threshold
     
     def _get_local_cp_tokens(self, total_tokens: int) -> int:
@@ -237,6 +240,10 @@ class CPAwareScheduler(Scheduler):
     def add_request(self, request: Request) -> None:
         """Add request, routing CP requests directly to active state."""
         if self.cp_world_size <= 1 or not self._is_long_request(request):
+            logger.info(f"[DYCP] Test: self.cp_world_size <= 1: {self.cp_world_size <= 1}.....")
+            logger.info(f"[DYCP] Test: self._is_long_request(request): {self._is_long_request(request)}.....")
+
+
             request.cp_ranks = [self.cp_rank]
 
             logger.info(f"[DYCP] Test: Add short request 添加短请求: {request.request_id}.....")
@@ -245,7 +252,7 @@ class CPAwareScheduler(Scheduler):
         else:
             # Client guarantees CP requests are broadcast to all ranks, so
             # activate immediately without a pending/announce phase.
-            logger.info("[DYCP] Long request detected, request_id = %s.", request.request_id)
+            logger.info("[DYCP] Test: Long request detected,添加长请求 request_id = %s.", request.request_id)
             request.cp_ranks = list(range(self.cp_world_size))
             self.active_cp_requests[request.request_id] = request
             self.requests[request.request_id] = request
@@ -289,11 +296,7 @@ class CPAwareScheduler(Scheduler):
         """
         self._preempted_this_step.clear()
 
-        logger.info(f"[DYCP] Test: 00000000000.....")
-
         output = super().schedule()
-
-        logger.info(f"[DYCP] Test: 11111111111.....")
 
         # Annotate output with CP metadata (needed by workers regardless of sync).
         output.cp_rank = self.cp_rank
@@ -310,30 +313,19 @@ class CPAwareScheduler(Scheduler):
         if output.cp_rank_scheduled_tokens is None:
             output.cp_rank_scheduled_tokens = {}
 
-        logger.info(f"[DYCP] Test: 22222222222.....")
-
         cp_req_set = set(cp_req_ids)
         for req_id in output.num_scheduled_tokens:
             output.cp_rank_scheduled_tokens[req_id] = (self.cp_world_size if req_id in cp_req_set else 1) # TODO [DyCP] 从变量定义来看，应该是记录该CP rank上对每个长请求调度的token数，为什么赋值是cp_world_size？还是变量命名有误？
             # output.cp_rank_scheduled_tokens[req_id] = self.cp_world_size 
-
-        logger.info(f"[DYCP] Test: 3333333333.....")
 
         # No sync needed (single DP or test environment without dp_group).
         if self.cp_sync is None:
             self._preempted_this_step.clear()
             return output
 
-        logger.info(f"[DYCP] Test: 4444444444.....")
-
         if not self.active_cp_requests:
-            logger.info(f"[DYCP] Test: 44433333.....")
-            # self.cp_sync.sync_empty()
-            logger.info(f"[DYCP] Test: 444222222.....")
             self._preempted_this_step.clear()
             return output
-
-        logger.info(f"[DYCP] Test: 555555555555.....")
 
         # Build per-request status vector for the all_reduce.
         active_ids = sorted(self.active_cp_requests.keys())
@@ -367,8 +359,6 @@ class CPAwareScheduler(Scheduler):
         confirmed, soft_rollback_ids, hard_rollback_ids = (
             self.cp_sync.sync_schedule_confirm(active_ids, status)
         )
-
-        logger.info(f"[DYCP] Test: 66666666666.....")
 
         # Clean up requests that finished on this rank before the sync.
         for req_id in finished_ids:
@@ -549,12 +539,34 @@ class CPAwareScheduler(Scheduler):
     ) -> dict[int, EngineCoreOutputs]:
         """Update scheduler state from model output."""
         result = super().update_from_output(scheduler_output, model_runner_output)
-        # TODO [DyCP] 这里看起来只是重写调用了父类方法，有无必要？？？？
-
         # Do NOT clean up active_cp_requests here. Removal is handled in
         # schedule() once we detect req_id not in self.requests.
         # Removing here would make active_ids diverge between ranks on the
         # next step (one rank finishes a step earlier), causing slot mismatches
         # in the all-reduce and breaking the sync protocol.
+
+        # [DyCP] A CP (long) request is decoded cooperatively by the `dycp_size`
+        # ranks of its CP group. The worker aligns the sampled tokens inside
+        # the group (PCPManager all_gather + `_sync_dycp_sampled_token_ids`
+        # broadcast src=0), but every rank in the group still independently
+        # emits an EngineCoreOutput for the request, so without suppression the
+        # client sees a duplicate token stream per CP request. Funnel the CP
+        # request's token/finish output to a single owner -- the cp_rank 0 of
+        # the group (== the broadcast src=0, whose tokens are authoritative).
+        # Non-owner ranks still run the full compute / consensus / KV-put here;
+        # only the *output* is muted.
+        if self.active_cp_requests and self.cp_rank != 0:
+            cp_req_ids = set(self.active_cp_requests)
+            for eco in result.values():
+                if eco.outputs:
+                    eco.outputs = [
+                        o for o in eco.outputs
+                        if o.request_id not in cp_req_ids
+                    ]
+                if eco.finished_requests:
+                    non_cp_finished = eco.finished_requests - cp_req_ids
+                    eco.finished_requests = (
+                        non_cp_finished if non_cp_finished else None
+                    )
 
         return result
