@@ -1403,18 +1403,35 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         request.client_index = self.client_index
 
         if self._is_cp_request(request):
-            # CP request: broadcast to ALL engines.
+            # CP request: route to a single DyCP subgroup (the `dycp_size`
+            # adjacent engines that cooperatively decode it), NOT all engines.
+            # Engines are in DP-rank order, so subgroup g is
+            # core_engines[g*dycp_size : (g+1)*dycp_size].
+            #
+            # TODO [DyCP] select the subgroup by load balancing (e.g. least
+            # loaded CP subgroup) instead of always pinning to subgroup 0.
+            cp_group = self.core_engines[: self.cp_world_size]
             awaitables = []
-            for engine in self.core_engines: # TODO [DyCP] 长请求是广播给所有engine还是CP Group中的DP Engine????
+            for engine in cp_group:
                 awaitables.append(
                     self._send_input(EngineCoreRequestType.ADD, request, engine)
                 )
+            # Owner = cp_rank 0 of the chosen subgroup (the first engine); its
+            # sampled tokens are authoritative and it is the sole emitter of
+            # the request's output stream (see CPAwareScheduler output merge).
+            owner_engine = cp_group[0]
+            logger.info(
+                "[DYCP] CP request %s routed to DyCP subgroup 0 "
+                "(engines=%s, cp_world_size=%d); owner/sole-emitter=%s.",
+                request.request_id, list(cp_group), self.cp_world_size,
+                owner_engine,
+            )
             # Track as CP request for abort routing.
-            self.reqs_in_flight[request.request_id] = self.core_engines[0]
+            self.reqs_in_flight[request.request_id] = owner_engine
             self.cp_request_ids.add(request.request_id)
             if not self.engines_running:
                 req_msg = msgspec.msgpack.encode(
-                    ("FIRST_REQ", self.core_engines[0])
+                    ("FIRST_REQ", owner_engine)
                 )
                 await self.first_req_send_socket.send(req_msg)
             for aw in awaitables:
@@ -1522,7 +1539,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # Fast-path common case.
             if engine := self.reqs_in_flight.get(req_id):
                 if req_id in self.cp_request_ids:
-                    for eng in self.core_engines:
+                    # CP requests live on a single DyCP subgroup; abort only it.
+                    # TODO [DyCP] when subgroup selection becomes load-based,
+                    # derive the owning subgroup from reqs_in_flight instead of
+                    # pinning to subgroup 0 (core_engines[:cp_world_size]).
+                    for eng in self.core_engines[: self.cp_world_size]:
                         await self._abort_requests([req_id], eng)
                 else:
                     await self._abort_requests(request_ids, engine)
@@ -1538,7 +1559,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     by_engine[engine].append(req_id)
 
         if cp_ids:
-            for eng in self.core_engines:
+            # CP requests live on a single DyCP subgroup; abort only it.
+            # TODO [DyCP] see note above re. load-based subgroup selection.
+            for eng in self.core_engines[: self.cp_world_size]:
                 await self._abort_requests(cp_ids, eng)
                 
         for engine, req_ids in by_engine.items():

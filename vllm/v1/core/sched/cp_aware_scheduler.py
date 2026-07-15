@@ -47,8 +47,9 @@ PREEMPTED = 0
 class CPSyncProtocol:
     """Post-schedule consensus protocol for CP request scheduling.
 
-    Uses the existing dp_group all-reduce MIN to agree on whether each active
-    CP request was successfully scheduled on ALL ranks in the current step.
+    Uses the DyCP subgroup (``dycp_group``) all-reduce MIN to agree on whether
+    each active CP request was successfully scheduled on ALL ranks of its CP
+    group in the current step.
 
     Three-state encoding per request:
         SCHEDULED (2)     - this rank scheduled the request
@@ -63,11 +64,18 @@ class CPSyncProtocol:
 
     def __init__(
         self,
-        dp_group: "ProcessGroup",
+        dycp_group: "ProcessGroup",
         cp_world_size: int,
         cp_rank: int,
     ):
-        self.dp_group = dp_group
+        # The consensus collective runs inside a single DyCP subgroup
+        # (dycp_size ranks), NOT the full DP group: only the ranks that
+        # cooperatively decode a given CP request need to agree on its
+        # schedule/rollback decision. Using the full DP group here was a
+        # leftover bug that forced CP requests to be broadcast to every DP
+        # rank (to keep all_reduce slots aligned) and produced duplicate
+        # outputs.
+        self.dycp_group = dycp_group
         self.cp_world_size = cp_world_size   # TODO [DyCP] self.cp_world_size 参数未用到，删除？
         self.cp_rank = cp_rank
 
@@ -103,7 +111,7 @@ class CPSyncProtocol:
         torch.distributed.all_reduce(
             self._confirm_tensor,
             op=torch.distributed.ReduceOp.MIN,
-            group=self.dp_group,
+            group=self.dycp_group,
         )
 
         confirmed: list[str] = []
@@ -145,7 +153,7 @@ class CPSyncProtocol:
         torch.distributed.all_reduce(
             self._confirm_tensor,
             op=torch.distributed.ReduceOp.MIN,
-            group=self.dp_group,
+            group=self.dycp_group,
         )
 
 
@@ -153,12 +161,14 @@ class CPAwareScheduler(Scheduler):
     """Scheduler with CP awareness for distributed DYCP.
 
     Each DP rank runs its own CPAwareScheduler. CP requests are coordinated
-    via a distributed sync protocol using the existing dp_group.
+    via a distributed sync protocol scoped to a single DyCP subgroup
+    (``dycp_group``) -- the ``dycp_size`` ranks that cooperatively decode a
+    given CP request -- NOT the full DP group.
 
     Key differences from base Scheduler:
     - Classifies requests as long (CP) or short (DP) based on token threshold
-    - CP requests are activated immediately on arrival (client guarantees
-      broadcast to all ranks, so no announce phase is needed)
+    - CP requests are activated immediately on arrival (the client routes a
+      CP request to the dycp_group that owns it, so no announce phase needed)
     - Only allocates local portion of KV cache for CP requests
     - Adds CP metadata to SchedulerOutput
     - Post-schedule all-reduce MIN agrees on confirmed/rollback decisions
@@ -171,7 +181,7 @@ class CPAwareScheduler(Scheduler):
         structured_output_manager: StructuredOutputManager,
         block_size: int,
         hash_block_size: int | None = None,
-        dp_group: "ProcessGroup | None" = None,
+        dycp_group: "ProcessGroup | None" = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
@@ -188,7 +198,9 @@ class CPAwareScheduler(Scheduler):
 
         logger.info("[DYCP] Initializing CPAwareScheduler.....")
 
-        assert dp_group is not None, "DP group must not be none in CPAwareScheduler"
+        assert dycp_group is not None, (
+            "DyCP subgroup must not be none in CPAwareScheduler"
+        )
 
         self.cp_world_size = vllm_config.parallel_config.dycp_size
         self.cp_rank = (
@@ -206,13 +218,28 @@ class CPAwareScheduler(Scheduler):
         # Tracks CP requests preempted by schedule() in the current step.
         self._preempted_this_step: set[str] = set()
 
-        # CP sync protocol (None if dp_group not provided, e.g., single DP).
+        # CP sync protocol (None if dycp_group not provided, e.g., single DP).
         self.cp_sync: CPSyncProtocol | None = None
-        if dp_group is not None and self.cp_world_size > 1:
+        if dycp_group is not None and self.cp_world_size > 1:
             self.cp_sync = CPSyncProtocol(
-                dp_group=dp_group,
+                dycp_group=dycp_group,
                 cp_world_size=self.cp_world_size,
                 cp_rank=self.cp_rank,
+            )
+            logger.info(
+                "[DYCP] CP consensus scoped to a single DyCP subgroup on "
+                "dp_rank=%d: cp_rank=%d, cp_world_size=%d. This rank %s the "
+                "CP output stream for CP requests it holds.",
+                vllm_config.parallel_config.data_parallel_rank,
+                self.cp_rank, self.cp_world_size,
+                "owns (emits)" if self.cp_rank == 0 else "suppresses",
+            )
+        else:
+            logger.info(
+                "[DYCP] CP consensus disabled on dp_rank=%d "
+                "(dycp_group=%s, cp_world_size=%d)",
+                vllm_config.parallel_config.data_parallel_rank,
+                dycp_group, self.cp_world_size,
             )
 
     # ------------------------------------------------------------------
@@ -557,16 +584,28 @@ class CPAwareScheduler(Scheduler):
         # only the *output* is muted.
         if self.active_cp_requests and self.cp_rank != 0:
             cp_req_ids = set(self.active_cp_requests)
+            suppressed = False
             for eco in result.values():
                 if eco.outputs:
+                    before = len(eco.outputs)
                     eco.outputs = [
                         o for o in eco.outputs
                         if o.request_id not in cp_req_ids
                     ]
+                    if len(eco.outputs) < before:
+                        suppressed = True
                 if eco.finished_requests:
                     non_cp_finished = eco.finished_requests - cp_req_ids
                     eco.finished_requests = (
                         non_cp_finished if non_cp_finished else None
                     )
+            if suppressed:
+                # Non-owner CP rank: muted the CP request's token/finish output;
+                # cp_rank 0 of this subgroup is the sole emitter.
+                logger.debug(
+                    "[DYCP] cp_rank=%d (non-owner) suppressed CP outputs for "
+                    "req_ids=%s this step.",
+                    self.cp_rank, sorted(cp_req_ids),
+                )
 
         return result

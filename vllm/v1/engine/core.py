@@ -153,11 +153,11 @@ class EngineCore:
             hash_block_size=hash_block_size,
         )
 
-        # CPAwareScheduler (but not base Scheduler) accepts dp_group for
-        # distributed CP sync. Pass it only when the scheduler class supports it
-        # to avoid breaking other scheduler implementations.
-        if supports_kw(Scheduler.__init__, "dp_group"):
-            scheduler_kwargs["dp_group"] = getattr(self, "dp_group", None)  # TODO [DyCP] self 是否有 dp_group 属性？？？？
+        # CPAwareScheduler (but not base Scheduler) accepts dycp_group (the DyCP
+        # subgroup used for CP consensus). Pass it only when the scheduler class
+        # supports it to avoid breaking other scheduler implementations.
+        if supports_kw(Scheduler.__init__, "dycp_group"):
+            scheduler_kwargs["dycp_group"] = getattr(self, "dycp_group", None)
         self.scheduler: SchedulerInterface = Scheduler(**scheduler_kwargs)
 
         self.use_spec_decode = vllm_config.speculative_config is not None
@@ -1697,10 +1697,57 @@ class DPEngineCoreProc(EngineCoreProc):
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
 
+        # Build the DyCP subgroup: the `dycp_size` ranks that cooperatively
+        # decode a single CP request. CP consensus must run *inside* this
+        # subgroup, not the full DP group, so only the ranks owning a CP
+        # request participate in its all-reduce. This matches the worker-side
+        # `_DYCP` comm group layout (adjacent DP ranks: {0,1},{2,3},...).
+        dycp_size = parallel_config.dycp_size
+        if dycp_size > 1:
+            assert dp_size % dycp_size == 0, (
+                f"[DYCP] dycp_size ({dycp_size}) must divide data_parallel_size "
+                f"({dp_size})"
+            )
+            # Subdivide DP ranks into CP subgroups of `dycp_size` adjacent ranks.
+            dycp_subgroups = [
+                list(range(i * dycp_size, (i + 1) * dycp_size))
+                for i in range(dp_size // dycp_size)
+            ]
+            from vllm.distributed.stateless_coordinator import (
+                StatelessGroupCoordinator,
+            )
+            dycp_coord = StatelessGroupCoordinator(
+                group_ranks=dycp_subgroups,
+                local_rank=local_dp_rank,
+                torch_distributed_backend="gloo",
+                use_device_communicator=False,
+                coord_store=dp_store,
+                group_name="dycp",
+                host=parallel_config.data_parallel_master_ip,
+                global_rank=dp_rank,
+                global_world_size=dp_size,
+            )
+            # Consensus is gloo (host-side); EngineCore has no device here.
+            self.dycp_group = dycp_coord.cpu_group
+            logger.info(
+                "[DYCP] Built dycp_group on dp_rank=%d: subgroups=%s "
+                "(this rank in subgroup %s, cp_rank=%d)",
+                dp_rank, dycp_subgroups, dycp_coord.ranks,
+                dp_rank % dycp_size,
+            )
+        else:
+            self.dycp_group = None
+            logger.info(
+                "[DYCP] dycp_group disabled on dp_rank=%d (dycp_size<=1)",
+                dp_rank,
+            )
+
     def shutdown(self):
         super().shutdown()
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
+        if dycp_group := getattr(self, "dycp_group", None):
+            stateless_destroy_torch_distributed_process_group(dycp_group)
 
     def _pause_complete(self) -> bool:
         """Two-phase DP-aware pause.
