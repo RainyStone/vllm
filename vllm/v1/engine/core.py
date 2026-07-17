@@ -1863,6 +1863,18 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
 
+            # [DyCP] Capture whether the scheduler had requests BEFORE stepping.
+            # step_fn() runs execute_model (and thus emits the per-step full-DP
+            # metadata all_reduce via _sync_metadata_across_dp) iff the scheduler
+            # had requests. On a 0-token finish step it still runs execute_model
+            # (the cadence dummy in worker.py emits that all_reduce) but returns
+            # executed=False. We must NOT additionally run execute_dummy_batch in
+            # that case, or this rank emits two metadata all_reduces in one
+            # iteration while idle ranks emit one -> the all_reduce count
+            # diverges from step_counter -> the every-N-step sync_dp_state
+            # all_reduce (on the same DP communicator) lands at a different stream
+            # position across ranks -> collective-type-mismatch deadlock.
+            had_reqs = self.scheduler.has_requests()
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
@@ -1872,9 +1884,12 @@ class DPEngineCoreProc(EngineCoreProc):
                     # All engines are idle.
                     continue
 
-                # We are in a running state and so must execute a dummy pass
-                # if the model didn't execute any ready requests.
-                self.execute_dummy_batch()
+                # Run a dummy pass only when no forward ran this iteration (an
+                # idle rank keeping collective cadence). When execute_model
+                # already ran (had_reqs True), the per-step metadata all_reduce
+                # was already emitted -- skip the dummy (see comment above).
+                if not had_reqs:
+                    self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
