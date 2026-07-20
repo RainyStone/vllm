@@ -259,6 +259,20 @@ class CPAwareScheduler(Scheduler):
         base = total_tokens // self.cp_world_size
         remainder = total_tokens % self.cp_world_size
         return base + (1 if self.cp_rank < remainder else 0)
+
+    def _cp_width_of(self, request: Request) -> int:
+        """CP shard width: long request = cp_world_size (dycp_size), short = 1.
+
+        Based on len(request.cp_ranks) (set in add_request: long =
+        list(range(cp_world_size)), short = [cp_rank]). Used for per-request KV
+        block accounting on the scheduler side -- long requests are accounted
+        by this rank's local shard, short requests by the full num_tokens
+        (long/short split). Always 1 when DyCP is off (cp_world_size <= 1).
+        """
+        if self.cp_world_size <= 1:
+            return 1
+        cp_ranks = getattr(request, "cp_ranks", None)
+        return len(cp_ranks) if cp_ranks else 1
     
     # ------------------------------------------------------------------
     # Request lifecycle
@@ -343,7 +357,16 @@ class CPAwareScheduler(Scheduler):
         cp_req_set = set(cp_req_ids)
         for req_id in output.num_scheduled_tokens:
             output.cp_rank_scheduled_tokens[req_id] = (self.cp_world_size if req_id in cp_req_set else 1) # TODO [DyCP] 从变量定义来看，应该是记录该CP rank上对每个长请求调度的token数，为什么赋值是cp_world_size？还是变量命名有误？
-            # output.cp_rank_scheduled_tokens[req_id] = self.cp_world_size 
+            # output.cp_rank_scheduled_tokens[req_id] = self.cp_world_size
+
+        # [DYCP] Step1 diag: long/short split counts this step (verify
+        # _cp_width_of distinguishes long=cp_world_size vs short=1).
+        num_dp_req = len(output.num_scheduled_tokens) - output.num_cp_request
+        logger.info(
+            "[DYCP] step cp_width summary: rank=%d cp_world_size=%d "
+            "num_cp_req=%d num_dp_req=%d",
+            self.cp_rank, self.cp_world_size, output.num_cp_request, num_dp_req,
+        )
 
         # No sync needed (single DP or test environment without dp_group).
         if self.cp_sync is None:

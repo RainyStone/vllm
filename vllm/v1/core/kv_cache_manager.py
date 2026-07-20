@@ -199,6 +199,25 @@ class KVCacheManager:
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
+        # [DYCP] Step4: CP long requests skip prefix cache hit for now. The
+        # hit granularity (block_size, no dycp) mismatches the worker's
+        # physical shard granularity (block_size*total_cp including dycp), so
+        # a hit would account full block_size blocks while the worker only
+        # writes 1/cp_width of each block on this rank -> KV misalignment risk.
+        # Return 0 hits (recompute) -- capacity correctness over hit rate.
+        # Proper cp-width-aware alignment is deferred to Step4b (TODO).
+        cp_ranks = getattr(request, "cp_ranks", None)
+        cp_width = len(cp_ranks) if cp_ranks else 1
+        if cp_width > 1:
+            if self.log_stats:
+                assert self.prefix_cache_stats is not None
+                self.prefix_cache_stats.record(
+                    num_tokens=request.num_tokens,
+                    num_hits=0,
+                    preempted=request.num_preemptions > 0,
+                )
+            return self.empty_kv_cache_blocks, 0
+
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
         # This can trigger recomputation of an entire block, rather than just
@@ -322,6 +341,14 @@ class KVCacheManager:
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
 
+        # [DYCP] Step2: derive per-request CP shard width from request.cp_ranks
+        # (set by CPAwareScheduler.add_request: long=list(range(cp_world_size)),
+        # short=[cp_rank]). Width=1 for short requests and when DyCP is off, so
+        # the default path is byte-for-byte unchanged. Long requests use width=
+        # cp_world_size so block accounting uses this rank's local shard.
+        cp_ranks = getattr(request, "cp_ranks", None)
+        cp_width = len(cp_ranks) if cp_ranks else 1
+
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
         num_local_computed_tokens = (
@@ -344,6 +371,7 @@ class KVCacheManager:
                 total_computed_tokens=total_computed_tokens,
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
+                cp_width=cp_width,
             )
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
                 return None
@@ -371,6 +399,7 @@ class KVCacheManager:
             total_computed_tokens=num_local_computed_tokens
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
+            cp_width=cp_width,
         )
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():

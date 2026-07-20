@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -93,6 +94,7 @@ class SingleTypeKVCacheManager(ABC):
         total_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        cp_width: int = 1,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -111,12 +113,38 @@ class SingleTypeKVCacheManager(ABC):
             apply_admission_cap: If True, clamp by `num_required_blocks` by
                 `_max_admission_blocks_per_request`for recycling-aware specs
                 (SWA, chunked-local).
+            cp_width: [DYCP] CP shard width for this request (long=
+                cp_world_size, short=1). Step2 plumbing only -- not yet used
+                to shrink num_tokens; Step3 will apply it.
 
         Returns:
             The number of blocks to allocate.
         """
+        # [DYCP] Step3: per-request local-shard accounting. Long requests
+        # (cp_width>1) split their KV across cp_width ranks (each rank holds
+        # ~1/cp_width of the sequence), so this rank accounts for its local
+        # shard by using block_size*cp_width as the effective block (one
+        # logical group = cp_width ranks' physical blocks). This is a per-call
+        # local variable -- self.block_size (global) is NOT mutated, so short
+        # requests (cp_width=1, eff_block_size==self.block_size) are
+        # byte-for-byte unchanged. Avoids the need for per-rank cp_rank here:
+        # cdiv(num_tokens, block_size*cp_width) matches each rank's physical
+        # cdiv(seq/cp_width, block_size) up to at most one slack block.
+        eff_block_size = (
+            self.block_size * cp_width if cp_width > 1 else self.block_size
+        )
+        num_required_blocks = cdiv(num_tokens, eff_block_size)
 
-        num_required_blocks = cdiv(num_tokens, self.block_size)
+        # [DYCP] Step2/3 diag: confirm cp_width propagation + local-shard block
+        # count. Only log long requests (cp_width>1) to avoid flooding.
+        if cp_width > 1:
+            logger.info(
+                "[DYCP] get_num_blocks_to_allocate req=%s cp_width=%d "
+                "num_tokens=%d block_size=%d eff_block_size=%d "
+                "num_required_blocks=%d",
+                request_id, cp_width, num_tokens, self.block_size,
+                eff_block_size, num_required_blocks,
+            )
         if apply_admission_cap and self._max_admission_blocks_per_request is not None:
             # Recycling-aware specs (SWA, chunked-local) cap the per-request
             # reservation here so admission matches the startup pool sizer

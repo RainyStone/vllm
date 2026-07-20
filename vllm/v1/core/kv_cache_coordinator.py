@@ -86,6 +86,7 @@ class KVCacheCoordinator(ABC):
         total_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        cp_width: int = 1,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -131,6 +132,7 @@ class KVCacheCoordinator(ABC):
                     total_computed_tokens,
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
+                    cp_width=cp_width,
                 )
         return num_blocks_to_allocate
 
