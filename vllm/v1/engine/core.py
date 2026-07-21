@@ -156,7 +156,7 @@ class EngineCore:
         # CPAwareScheduler (but not base Scheduler) accepts dycp_group (the DyCP
         # subgroup used for CP consensus). Pass it only when the scheduler class
         # supports it to avoid breaking other scheduler implementations.
-        if supports_kw(Scheduler.__init__, "dycp_group"):
+        if supports_kw(Scheduler.__init__, "dycp_group", allow_var_kwargs = False):
             scheduler_kwargs["dycp_group"] = getattr(self, "dycp_group", None)
         self.scheduler: SchedulerInterface = Scheduler(**scheduler_kwargs)
 
