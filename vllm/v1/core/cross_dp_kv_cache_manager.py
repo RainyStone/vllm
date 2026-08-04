@@ -466,6 +466,20 @@ class CrossDPKVCacheManager:
         for idx, rank in enumerate(cp_ranks):
             block_pool = self.block_pools[rank]
             if num_blocks_to_allocate[idx] > block_pool.get_num_free_blocks():
+                # [diag-alloc-none] why allocate_slots returns None for a
+                # (likely offload-load-resumed) running request. need vs free
+                # per rank, plus the token accounting that derived need.
+                logger.info(
+                    "[diag-alloc-none] req=%s cp_ranks=%s rank=%d "
+                    "need_blocks=%d free_blocks=%d num_new=%d num_ext=%d "
+                    "req_num_computed=%d total_computed=%d need_slot=%d "
+                    "delay_cache=%s",
+                    request.request_id, cp_ranks, rank,
+                    num_blocks_to_allocate[idx], block_pool.get_num_free_blocks(),
+                    num_new_tokens, num_external_computed_tokens,
+                    request.num_computed_tokens,
+                    num_local_computed_tokens + num_external_computed_tokens,
+                    num_tokens_need_slot, delay_cache_blocks)
                 return None
 
         assert not any(new_computed_block_list), (

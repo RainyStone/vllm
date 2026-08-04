@@ -261,6 +261,28 @@ class CrossDPScheduler(Scheduler):
         # taken, preventing the counter from going negative.
         self.long_running_req_ids: set[str] = set()
 
+        # [offload-adapt M4] Bind the KV connector to the GPU block pool(s).
+        # Baseline RecomputeScheduler does bind_gpu_block_pool(.block_pool) but
+        # CrossDPKVCacheManager exposes block_pools (list), not a singular
+        # block_pool. Without binding, RecomputeCPUOffloadScheduler.
+        # _gpu_block_pool stays None and offload silently never engages.
+        if self.connector is not None:
+            bind_pools = getattr(self.connector, "bind_gpu_block_pools", None)
+            bind_pool = getattr(self.connector, "bind_gpu_block_pool", None)
+            if bind_pools is not None:
+                bind_pools(self.kv_cache_manager.block_pools)
+                logger.info(
+                    "[offload-adapt] CrossDP bound gpu pools: cp_world_size=%d lists=%d",
+                    self.cp_world_size, len(self.kv_cache_manager.block_pools),
+                )
+            elif bind_pool is not None:
+                bind_pool(self.kv_cache_manager.block_pools[0])
+                if self.cp_world_size > 1:
+                    logger.warning(
+                        "[offload-adapt] CP>1 but connector only supports single-pool bind; "
+                        "offload will cover at most 1 rank until M1 (per-rank manager) lands."
+                    )
+
     def _mark_long_running(self, request: Request) -> None:
         """Mark *request* as occupying a long-request slot.
 
@@ -424,6 +446,9 @@ class CrossDPScheduler(Scheduler):
         """
         assert self.connector is not None
         if request.request_id not in self.finished_recving_kv_req_ids:
+            logger.info(
+                "[diag-wait] REMOTE_NOT_READY req=%s not in finished_recving_ids (ids=%s)",
+                request.request_id, list(self.finished_recving_kv_req_ids)[:8])
             return False
 
         if request.request_id in self.failed_recving_kv_req_ids:
@@ -472,7 +497,12 @@ class CrossDPScheduler(Scheduler):
             self.connector.update_connector_output(kv_connector_output)
 
         # KV Connector:: update recv and send status from last step.
-        for req_id in kv_connector_output.finished_recving or ():
+        _recv = kv_connector_output.finished_recving
+        if _recv:
+            logger.info(
+                "[diag-recv] scheduler saw finished_recving=%s (ids_before=%s)",
+                _recv, list(self.finished_recving_kv_req_ids)[:8])
+        for req_id in _recv or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
@@ -798,6 +828,16 @@ class CrossDPScheduler(Scheduler):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        logger.info("-------------------------new schedule [cross dp scheduler]---------------------")
+        flagg = 1
+        # [flagg-rate-limit] remember requests flagg has already preempted so
+        # the forced-preempt simulation hits each request at most once
+        # (prevents the 抢->offload->load->decode1->再抢 loop from starving
+        # the run after every request has been preempted once). Lazily created
+        # to avoid touching __init__; persists across schedule() frames.
+        if not hasattr(self, '_flagg_preempted_req_ids'):
+            self._flagg_preempted_req_ids = set()
+
         scheduled_new_reqs: list[list[Request]] = [[] for _ in range(self.cp_world_size)]
         scheduled_resumed_reqs: list[list[Request]] = [[] for _ in range(self.cp_world_size)]
         scheduled_running_reqs: list[list[Request]] = [[] for _ in range(self.cp_world_size)]
@@ -858,8 +898,11 @@ class CrossDPScheduler(Scheduler):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        request_num = 0
+        logger.info(f'>>>>>>>>> [DyCP] 00000000000000000000000000000')
         while req_index < len(self.running) and max(rank_budgets) > 0:
             request = self.running[req_index]
+            request_num += 1
 
             if (
                 request.num_output_placeholders > 0
@@ -875,6 +918,7 @@ class CrossDPScheduler(Scheduler):
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
                 req_index += 1
+                logger.info(f'>>>>>>>>> [DyCP] 111111111111111111111')
                 continue
 
             num_new_tokens = (
@@ -933,20 +977,38 @@ class CrossDPScheduler(Scheduler):
                 elif batch_type != req_type:
                     # This request's type conflicts with the batch type, skip it.
                     req_index += 1
+                    logger.info(f'>>>>>>>>> [DyCP] 2222222222222222222222222')
                     continue
 
+            logger.info(f'>>>>>>>>> [DyCP] 333333333333333333333333')
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
+                    logger.info(f"--------------len(self.running): {len(self.running)}, request_num: {request_num}" )
+                    _flagg_triggered = False
+                    # [flagg-rate-limit] only force-preempt if there is at least
+                    # one running request that flagg has NOT yet preempted;
+                    # otherwise flagg would spin (trigger -> no victim -> stall).
+                    if (len(self.running) > 1 and flagg == 1 and request_num == 1
+                            and any(r.request_id not in self._flagg_preempted_req_ids
+                                    for r in self.running if r is not request)):
+                        new_blocks = None
+                        flagg = 0
+                        _flagg_triggered = True
+                    else:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
                         request.cp_ranks,
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
+                    logger.info(f"--------------new_blocks: {new_blocks}" )
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        logger.info(f'>>>>>>>>> break schedule')
                         break
+
+                    logger.info(f'>>>>>>>>> get in premmpt')
 
                     """
                     TODO(AoChen): PRIORITY is not implemented yet.
@@ -964,10 +1026,28 @@ class CrossDPScheduler(Scheduler):
                         preempted_req = None
                         for i in range(len(self.running) - 1, -1, -1):
                             candidate = self.running[i]
-                            if candidate is not request and any(
-                                r in request.cp_ranks for r in candidate.cp_ranks
-                            ):
+                            # if candidate is not request and any(
+                            #     r in request.cp_ranks for r in candidate.cp_ranks
+                            # ):
+                            #     preempted_req = self.running.pop(i)
+                            #     break
+                            if candidate is not request:
+                                # [flagg-rate-limit] when this is a forced
+                                # preempt (flagg) simulation, never preempt a
+                                # request flagg already preempted before -> each
+                                # request is force-preempted at most once. Real
+                                # preemptions (allocate_slots returned None,
+                                # _flagg_triggered False) are unaffected.
+                                if _flagg_triggered and candidate.request_id in self._flagg_preempted_req_ids:
+                                    continue
                                 preempted_req = self.running.pop(i)
+                                if _flagg_triggered:
+                                    self._flagg_preempted_req_ids.add(preempted_req.request_id)
+                                    logger.info(
+                                        "[flagg-rate-limit] flagged preempt req=%s "
+                                        "(flagg-preempted total=%d)",
+                                        preempted_req.request_id,
+                                        len(self._flagg_preempted_req_ids))
                                 break
 
                         if preempted_req is None:
@@ -977,6 +1057,83 @@ class CrossDPScheduler(Scheduler):
                         self.request_manager.free_req(preempted_req)
                         self._unmark_long_running(preempted_req)
                         self.waiting.has_slot_for_long_request = self.request_manager.has_slot_for_long_request()
+
+                        # [offload-adapt M5] offload-preempt fork (kv_consumer D
+                        # node only): mirror the victim KV to CPU via the
+                        # connector BEFORE _preempt_request (below) frees the GPU
+                        # blocks. All-or-nothing across the victim cp_ranks; on
+                        # any-rank failure discard partial per-rank CPU states and
+                        # fall back to local-free recompute (no PD-proxy, no
+                        # update_from_output / output-contract change). kv_producer
+                        # / no-connector / no-hook keep original rank-aware FCFS.
+                        transfer_config = self.vllm_config.kv_transfer_config
+                        _fork_entered = False
+                        if (transfer_config is not None
+                                and not transfer_config.is_kv_producer
+                                and self.connector is not None):
+                            preempt_hook = getattr(
+                                self.connector, "update_state_before_preempt", None)
+                            if preempt_hook is not None:
+                                _fork_entered = True
+                                # Capture BEFORE _preempt_request zeroes
+                                # num_computed_tokens and frees GPU blocks
+                                # (load-bearing order: capture -> hook -> free).
+                                # free_req above is rank-count bookkeeping only.
+                                composed_num_computed = preempted_req.num_computed_tokens
+                                # get_block_ids is POSITION-indexed in cp_ranks
+                                # order; pair each position with its rank value.
+                                # Do NOT index by rank value.
+                                rank_block_ids = self.kv_cache_manager.get_block_ids(preempted_req)
+                                committed_ranks = []
+                                all_offloaded = True
+                                for pos, rank in enumerate(preempted_req.cp_ranks):
+                                    ok = bool(preempt_hook(
+                                        preempted_req,
+                                        rank_block_ids[pos],
+                                        composed_num_computed,
+                                        cp_rank=rank))
+                                    logger.debug(
+                                        "[offload-adapt M5] rank fork req=%s rank=%s pos=%d blocks=%d offloaded=%s",
+                                        preempted_req.request_id, rank, pos,
+                                        len(rank_block_ids[pos]), ok)
+                                    if ok:
+                                        committed_ranks.append(rank)
+                                    else:
+                                        all_offloaded = False
+                                        break
+                                if all_offloaded:
+                                    logger.info(
+                                        "[offload-adapt M5] offload-preempt OK req=%s computed=%d ranks=%s",
+                                        preempted_req.request_id,
+                                        composed_num_computed,
+                                        list(preempted_req.cp_ranks))
+                                else:
+                                    # All-or-nothing: discard per-rank CPU states
+                                    # committed before the failure so
+                                    # build_connector_meta cannot emit stale store
+                                    # specs for GPU ids about to be freed. Then
+                                    # fall through to _preempt_request (local
+                                    # free + requeue for recompute).
+                                    discard_hook = getattr(
+                                        self.connector, "discard_preempt_state", None)
+                                    if discard_hook is not None:
+                                        for rank in committed_ranks:
+                                            discard_hook(preempted_req, cp_rank=rank)
+                                    logger.info(
+                                        "[offload-adapt M5] offload-preempt FAIL req=%s computed=%d committed=%s -> local free recompute",
+                                        preempted_req.request_id,
+                                        composed_num_computed,
+                                        committed_ranks)
+                        # Debug trace: why did we NOT enter the offload fork?
+                        if not _fork_entered:
+                            _reason = (
+                                "kv_producer" if (transfer_config is not None
+                                                  and transfer_config.is_kv_producer)
+                                else ("no-transfer-config" if transfer_config is None
+                                      else "no-connector-or-hook"))
+                            logger.debug(
+                                "[offload-adapt M5] offload-fork SKIPPED req=%s reason=%s -> plain FCFS preempt",
+                                preempted_req.request_id, _reason)
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
 
@@ -991,10 +1148,12 @@ class CrossDPScheduler(Scheduler):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                logger.info(f'>>>>>>>>> [DyCP] 444444444444444444444444444444444444')
                 break
 
             assert len(request.cp_ranks) == len(new_blocks)
             # Schedule the request.
+            logger.info(f'>>>>>>>>> [DyCP] 555555555555555555555555555555555')
             for i, rank in enumerate(request.cp_ranks):
                 scheduled_running_reqs[rank].append(request)
                 request_id = request.request_id
@@ -1009,15 +1168,29 @@ class CrossDPScheduler(Scheduler):
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
+        logger.info(f'>>>>>>>>> [DyCP] 6666666666666666666666666')
         # Next, schedule the WAITING requests.
         if not any(preempted_reqs):
+            logger.info(f'>>>>>>>>> [DyCP] 77777777777777777777')
+            if not (self.waiting and max(rank_budgets) > 0):
+                logger.info(
+                    "[diag-wait] WHILE_SKIP waiting_empty=%s max_budget=%d running=%d",
+                    not bool(self.waiting), max(rank_budgets), len(self.running))
             while self.waiting and max(rank_budgets) > 0:
                 if len(self.running) == (
                     (self.max_num_running_reqs - self.waiting.running_long_count) * self.cp_world_size + self.waiting.running_long_count
                 ):
+                    logger.info(
+                        "[diag-wait] CAPACITY break running=%d rhs=%d max_run=%d long=%d cp_world=%d",
+                        len(self.running),
+                        (self.max_num_running_reqs - self.waiting.running_long_count) * self.cp_world_size + self.waiting.running_long_count,
+                        self.max_num_running_reqs, self.waiting.running_long_count, self.cp_world_size)
                     break
                 request = self.waiting.peek_request()
                 if request is None:
+                    logger.info(
+                        "[diag-wait] PEEK_NONE break waiting_empty=%s max_budget=%d running=%d",
+                        not bool(self.waiting), max(rank_budgets), len(self.running))
                     break
 
                 # KVTransfer: skip request if still waiting for remote kvs.
@@ -1032,6 +1205,9 @@ class CrossDPScheduler(Scheduler):
                         else:
                             request.status = RequestStatus.WAITING
                     else:
+                        logger.info(
+                            "[diag-wait] REMOTE_NOT_READY pop-skipped req=%s num_computed=%d",
+                            request.request_id, request.num_computed_tokens)
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id,
@@ -1078,6 +1254,9 @@ class CrossDPScheduler(Scheduler):
                         )
 
                         if ext_tokens is None:
+                            logger.info(
+                                "[diag-wait] EXT_TOKENS_NONE pop-skipped req=%s status=%s num_computed=%d",
+                                request.request_id, request.status, request.num_computed_tokens)
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
@@ -1167,6 +1346,10 @@ class CrossDPScheduler(Scheduler):
                         if batch_type is None:
                             batch_type = req_type
                         elif batch_type != req_type:
+                            logger.info(
+                                "[diag-wait] BATCH_TYPE break req=%s batch_type=%s req_type=%s num_computed=%d status=%s",
+                                request.request_id, batch_type, req_type,
+                                request.num_computed_tokens, request.status)
                             # This request's type conflicts with the batch type, skip it.
                             # Do not pop from waiting queue, just break to stop scheduling.
                             break
@@ -1198,19 +1381,48 @@ class CrossDPScheduler(Scheduler):
                 )
 
                 kv_role = getattr(self.vllm_config.kv_transfer_config, "kv_role", None)
-                if kv_role == 'kv_consumer' and request.status == RequestStatus.PREEMPTED:
-                    specify_dp = True
-                else:
+                # [offload-adapt M6] An offload-captured preempted request must
+                # resume on its ORIGINAL cp_ranks (prev_cp_ranks, captured at
+                # preempt time) so M7 H2D loads the CPU shard back to the SAME
+                # rank GPU pool. Otherwise select_dp re-routes it (the
+                # specify_dp downgrade) and M7 mismatch-skips the load -> offload
+                # wasted, falls back to recompute. Only take this branch on a
+                # genuine offload hit: PREEMPTED + load_kv_async (the offload-
+                # ready path from get_num_new_matched_tokens) + a captured
+                # prev_cp_ranks + connector confirms a captured state.
+                _prev_cp_ranks = list(getattr(request, 'prev_cp_ranks', None) or [])
+                _offload_hit = (
+                    kv_role == 'kv_consumer'
+                    and request.status == RequestStatus.PREEMPTED
+                    and bool(_prev_cp_ranks)
+                    and load_kv_async
+                    and self.connector is not None
+                    and bool(getattr(self.connector, 'has_preempted_request',
+                                     lambda _r: False)(request.request_id)))
+                if _offload_hit:
+                    selected_dp = _prev_cp_ranks
                     specify_dp = False
-                
-                selected_dp = self.request_manager.select_dp(
-                    request,
-                    self.waiting.is_long_request(request),
-                    specify_dp,
-                    num_new_tokens,
-                    rank_budgets,
-                )
+                    logger.info(
+                        "[offload-adapt M6] offload hit -> resume original "
+                        "cp_ranks=%s req=%s (skip specify_dp re-route)",
+                        selected_dp, request.request_id)
+                else:
+                    if kv_role == 'kv_consumer' and request.status == RequestStatus.PREEMPTED:
+                        specify_dp = True
+                    else:
+                        specify_dp = False
+                    selected_dp = self.request_manager.select_dp(
+                        request,
+                        self.waiting.is_long_request(request),
+                        specify_dp,
+                        num_new_tokens,
+                        rank_budgets,
+                    )
                 if selected_dp is None:
+                    logger.info(
+                        "[diag-wait] SELECT_NONE pop-skipped req=%s cp_ranks=%s num_new=%d num_req_per_dp=%s",
+                        request.request_id, list(getattr(request, 'cp_ranks', []) or []),
+                        num_new_tokens, self.request_manager.num_req_per_dp)
                     # Cannot place this request on any rank right now.
                     # Skip it and try smaller requests behind it.
                     self.waiting.pop_request()
@@ -1412,6 +1624,7 @@ class CrossDPScheduler(Scheduler):
                 scheduler_output.req_id_to_cp_size = req_id_to_cp_size
                 scheduler_output.cp_rank_to_req_id = cp_rank_to_req_id[idx]    # revised
                 scheduler_output.new_block_ids_to_zero = new_block_ids_to_zero
+                scheduler_output.cp_rank = idx
                 total_scheduler_output.append(scheduler_output)
             else:
                 total_scheduler_output.append(

@@ -349,6 +349,9 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        logger.info("-------------------------new schedule [scheduler]---------------------")
+        flagg = 1
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -374,8 +377,10 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        request_num = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            request_num += 1
             current_batch_size = len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs)
             if current_batch_size == self.max_num_per_batch:
                 break
@@ -454,15 +459,23 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
+                    logger.info(f"--------------len(self.running): {len(self.running)}, request_num: {request_num}" )
+                    if (len(self.running) > 1 and flagg == 1 and request_num == 1):
+                        new_blocks = None
+                        flagg = 0
+                    else:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                        request.cp_ranks,
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
-
+                    logger.info(f"--------------new_blocks: {new_blocks}" )
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
+
+                    logger.info(f'>>>>>>>>> get in premmpt')
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
