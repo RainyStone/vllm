@@ -14,7 +14,7 @@ each rank successfully scheduled each CP request in the current step.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
@@ -242,6 +242,22 @@ class CPAwareScheduler(Scheduler):
                 dycp_group, self.cp_world_size,
             )
 
+        # [DyCP] P(prefill/producer) 端长请求由 dycp 组内 cp_rank=0..N-1 协同 prefill，
+        # 各 rank 各持自己 block_id 段（block_id 不跨 rank 协调）。funnel 只让
+        # cp_rank=0 发 EngineCoreOutput 会导致其它 cp_rank 的 block_id 丢失，D 只拉
+        # 一段 KV 而错答。此处缓冲各 cp_rank 上报的 per-req block_id 段，由
+        # owner(cp_rank=0) 在 update_from_output 经 gloo all_gather 收齐后拼成
+        # per-cp_rank 多段 remote_block_ids 一份传 D。
+        # 结构: {req_id: {cp_rank: remote_block_ids_segment}}（segment 为 BlockIds，
+        # per-group）。req 全 cp_rank 段到齐后由 owner 拼多段并清理。
+        self._dycp_block_shards: dict[str, dict[int, Any]] = {}
+        self._gather_enabled = (
+            self.cp_sync is not None
+            and self.cp_world_size > 1
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.is_kv_producer
+        )
+
     # ------------------------------------------------------------------
     # Request classification and routing
     # ------------------------------------------------------------------
@@ -433,7 +449,7 @@ class CPAwareScheduler(Scheduler):
         # Signal workers to run a dummy forward for collective ops when this
         # rank has no tokens but peer ranks have confirmed CP tokens.
         if output.total_num_scheduled_tokens == 0 and confirmed:
-            output.none_tokens_in_peer_sched = True   # TODO [DyCP] 这里为什么这样？？？？
+            output.none_tokens_in_peer_sched = True   # TODO [DyCP] 这里为什么？？？？
 
 
         logger.info(f"[DYCP] Test: 44444444: CPAwareScheduler调度结束.....")
@@ -589,6 +605,16 @@ class CPAwareScheduler(Scheduler):
     ) -> dict[int, EngineCoreOutputs]:
         """Update scheduler state from model output."""
         result = super().update_from_output(scheduler_output, model_runner_output)
+
+        # [DyCP] 阶段1: P 端 owner 聚合各 cp_rank 的 block_id 段。
+        # 各 cp_rank 各自 prefill 长 prompt 的一段、各持自己 block_id（block_id 不跨
+        # rank 协调）。本步若有 CP req finish，本 rank 把它在该 req 上的
+        # remote_block_ids 段经 gloo all_gather 交换给全组；owner(cp_rank=0) 收齐后
+        # 拼成 per-cp_rank 多段写进 owner 的 kv_transfer_params，使 D 能多源拉全 KV。
+        # 对称性：仅当本组仍有 active CP 请求（或本步刚 finish CP req）时才进 gather，
+        # 该条件由 CP sync 保证两组同 true/false，避免 all_gather 错步死锁。
+        self._maybe_gather_dycp_block_shards(result)
+
         # Do NOT clean up active_cp_requests here. Removal is handled in
         # schedule() once we detect req_id not in self.requests.
         # Removing here would make active_ids diverge between ranks on the
@@ -632,3 +658,64 @@ class CPAwareScheduler(Scheduler):
                 )
 
         return result
+
+    def _maybe_gather_dycp_block_shards(
+        self, result: dict[int, EngineCoreOutputs]
+    ) -> None:
+        """[DyCP] P 端: 各 cp_rank 经 gloo all_gather 交换本步 finish 的 CP req
+        block_id 段, owner(cp_rank=0) 收齐拼 per-cp_rank 多段写回 kv_transfer_params。
+
+        见 __init__ 的 _dycp_block_shards 注释。对称性: 仅当本组仍有 CP 请求在跑时
+        才进 gather, 该条件由 CP sync 保证两组同 true/false, 避免错步死锁。
+        """
+        if not self._gather_enabled:
+            return
+
+        # 1) 收集本 rank 这步 finish 的 CP req -> remote_block_ids 段。
+        #    段来自 base scheduler _connector_finished -> connector.request_finished
+        #    填进 EngineCoreOutput.kv_transfer_params['remote_block_ids']。
+        my_finished: dict[str, Any] = {}
+        cp_ids = set(self.active_cp_requests)
+        for eco in result.values():
+            for o in eco.outputs:
+                if (o.request_id in cp_ids
+                        and o.kv_transfer_params is not None
+                        and o.kv_transfer_params.get("remote_block_ids") is not None):
+                    my_finished[o.request_id] = o.kv_transfer_params["remote_block_ids"]
+
+        # 对称条件: 仅当本步有新 finish 的 CP req, 或缓冲中仍有未拼齐段时才 gather。
+        # 注意: active_cp_requests 在 req finish 后可能仍非空(P 端 D 未 ack), 故不能
+        # 用它作每步 gather 触发, 否则 finish 后每步空 gather 会因两 rank 调用节奏
+        # 不一致而 gloo 对称性死锁。两 rank 对 my_finished 非空/缓冲非空的判定在
+        # 同步 finish 下一致(见 v14 证实两 cp_rank 同步 finish), 错步时另作兜底。
+        if not my_finished and not self._dycp_block_shards:
+            return
+
+        # 2) gloo all_gather 交换各 rank 这步的 finish 字典(对称调用)。
+        gathered: list[dict[str, Any]] = [{} for _ in range(self.cp_world_size)]
+        torch.distributed.all_gather_object(
+            gathered, my_finished, group=self.cp_sync.dycp_group,
+        )
+
+        # 3) 合并进 per-req 缓冲 {req_id: {cp_rank: seg}}。
+        newly_complete: list[str] = []
+        for rank, fin in enumerate(gathered):
+            for req_id, seg in fin.items():
+                shards = self._dycp_block_shards.setdefault(req_id, {})
+                if rank not in shards:
+                    shards[rank] = seg
+        for req_id, shards in self._dycp_block_shards.items():
+            if len(shards) == self.cp_world_size:
+                newly_complete.append(req_id)
+
+        # 4) 已拼齐的 req 清缓冲: 所有 rank 一致清理(不只 owner), 保证两 rank
+        #    _dycp_block_shards 同步变空, 避免 finish 后 non-owner 缓冲残留导致
+        #    gather 触发不对称而死锁。owner 额外把多段写回 kv_transfer_params。
+        for req_id in newly_complete:
+            shards = self._dycp_block_shards.pop(req_id)
+            if self.cp_rank == 0:
+                merged = [shards[r] for r in range(self.cp_world_size)]
+                for eco in result.values():
+                    for o in eco.outputs:
+                        if o.request_id == req_id and o.kv_transfer_params is not None:
+                            o.kv_transfer_params["remote_block_ids"] = merged
