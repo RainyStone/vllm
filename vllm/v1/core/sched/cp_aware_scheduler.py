@@ -667,6 +667,46 @@ class CPAwareScheduler(Scheduler):
 
         见 __init__ 的 _dycp_block_shards 注释。对称性: 仅当本组仍有 CP 请求在跑时
         才进 gather, 该条件由 CP sync 保证两组同 true/false, 避免错步死锁。
+
+        数据变化示例 (dycp_size=4, req-A prefill 完成, 各 cp_rank 持各自独立
+        block pool 分配的 block_id 段, block_id 不跨 rank 协调):
+
+          初始 — 4 个独立进程各持自己的段:
+            cp_rank=0: 段0=([1],)   cp_rank=1: 段1=([2],)
+            cp_rank=2: 段2=([3],)   cp_rank=3: 段3=([4],)
+
+          步骤1 — 各 rank 收集本进程的 my_finished (只含自己那段):
+            rank0: {"req-A": ([1],)}   rank1: {"req-A": ([2],)}
+            rank2: {"req-A": ([3],)}   rank3: {"req-A": ([4],)}
+
+          步骤2 — gloo all_gather_object 交换后, 4 个进程都拿到全量:
+            gathered = [
+              {"req-A": ([1],)},   # index 0 = cp_rank=0
+              {"req-A": ([2],)},   # index 1 = cp_rank=1
+              {"req-A": ([3],)},   # index 2 = cp_rank=2
+              {"req-A": ([4],)},   # index 3 = cp_rank=3
+            ]
+
+          步骤3 — 合并进跨步缓冲 _dycp_block_shards:
+            _dycp_block_shards = {
+              "req-A": {0: ([1],), 1: ([2],), 2: ([3],), 3: ([4],)}
+            }
+            len(shards)==4==cp_world_size → 拼齐, newly_complete=["req-A"]
+
+          步骤4 — 所有 rank 一致 pop (缓冲同步变空, 防下一步不对称死锁);
+            owner(cp_rank=0) 额外写回自己的 EngineCoreOutput:
+              remote_block_ids = [([1],), ([2],), ([3],), ([4],)]
+              ↑ per-cp_rank 多段 list, 非 owner 不写回 (output 被 funnel suppress)
+
+          D 端 — funnel 只发 cp_rank=0 的 output, D 收到多段:
+            remote_block_ids = [([1],), ([2],), ([3],), ([4],)]
+            remote_dycp_ranks = [0, 1, 2, 3]
+            按 remote_dycp_ranks 拆 4 shard, 各从对应 P rank 的 host/port
+            mooncake RDMA 拉 block 1/2/3/4 的 KV, 4 源拼全 KV → D decode 正确。
+
+        跨步缓冲 (防御性): 正常 CP sync 保证 4 rank 同步 finish, 同一步全段到齐。
+        若极端某 rank 段延迟一步, 暂存缓冲, 下步继续 gather 直到拼齐——但对称性
+        要求同组 rank 同时进/退 gather, 该前提由 CP sync 共识保证。
         """
         if not self._gather_enabled:
             return
