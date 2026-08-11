@@ -657,7 +657,67 @@ class CPAwareScheduler(Scheduler):
                     self.cp_rank, sorted(cp_req_ids),
                 )
 
+        # [DyCP] 发送端统一: 把所有 D-bound 输出的 remote_block_ids 规整为
+        # per-cp_rank canonical 多段, 使 D 端无需结构判别(见下方方法)。
+        self._normalize_dycp_remote_block_ids(result)
+
         return result
+
+    def _normalize_dycp_remote_block_ids(
+        self, result: dict[int, EngineCoreOutputs]
+    ) -> None:
+        """[DyCP] 发送端(P)统一 remote_block_ids 结构为 per-cp_rank canonical 多段。
+
+        根因: P 端对 remote_block_ids 历史上有两种产出形态, 是 v48/v50 D 端反复
+        打补丁的根结:
+          (1) per-cp_rank 多段(3 层): 经 _maybe_gather_dycp_block_shards 合并后,
+              owner(cp_rank=0) 写回 [seg0, seg1, ...], len == len(remote_dycp_ranks)。
+          (2) per-group 扁平(2 层): 未合并时(短请求不经 gather; 或长请求因部分 cp_rank
+              hard rollback 致 gather 收不齐段), 由 _connector_finished 直接产出 ([1],)。
+        两态混发使 D 端 _get_kv_split_metadata 须猜结构: 按 len(remote_dycp_ranks)>1
+        判别会误判回滚单 owner 的多 rank 请求(v50); 按 owner 槽位扩段又会用 rank 值
+        当索引、误清空短请求 block_ids(v51 S0, owner_slot=1 != 槽 0)。
+
+        统一方案: 在发送的唯一公共出口(update_from_output, funnel 之后)把所有
+        D-bound 输出的 flat(2 层) 一律规整为 3 层 canonical:
+            [(flat) if i == 0 else empty_seg for i in range(len(remote_dycp_ranks))]
+        依据不变式: 发射该 flat 的 rank 恒在 remote_dycp_ranks 的 index 0——
+          短请求: remote_dycp_ranks = [sole_cp_rank], sole 在 index 0;
+          长请求: remote_dycp_ranks = list(range(cp_world_size)) = [0,1,...],
+                  发射者 owner = cp_rank=0 在 index 0(hard rollback 时也仅 owner 发射)。
+        已是 3 层(gather 合并)则不动。规整后 D 端恒以
+        meta_remote_block_ids[cp_rank_idx][group_idx] 索引, 无需任何结构判别。
+        """
+        for eco in result.values():
+            for o in eco.outputs:
+                p = o.kv_transfer_params
+                if not p:
+                    continue
+                rb = p.get("remote_block_ids")
+                if rb is None:
+                    continue
+                ranks = p.get("remote_dycp_ranks") or [0]
+                n = len(ranks)
+                if n == 0:
+                    continue
+                # 判别 3 层(per-cp_rank) vs 2 层(per-group flat):
+                # 段首非空 group 元素是 list -> 3 层; 是 int(block_id) -> 2 层 flat。
+                is_3level = False
+                try:
+                    for seg in rb:
+                        if not hasattr(seg, "__len__") or len(seg) == 0:
+                            continue
+                        is_3level = hasattr(seg[0], "__len__")
+                        break
+                except (TypeError, IndexError):
+                    is_3level = False
+                if is_3level:
+                    continue
+                # flat(2 层) -> canonical 3 层, 发射段恒在 index 0, 其余槽位置空段。
+                num_groups = len(rb)
+                empty_seg = tuple([] for _ in range(num_groups))
+                canon = [rb if i == 0 else empty_seg for i in range(n)]
+                p["remote_block_ids"] = canon
 
     def _maybe_gather_dycp_block_shards(
         self, result: dict[int, EngineCoreOutputs]
