@@ -32,10 +32,6 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
-    from vllm.distributed.kv_transfer.kv_connector.v1 import (
-        KVConnectorBase_V1)
-    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-        KVConnectorMetadata)
 
 logger = init_logger(__name__)
 
@@ -343,48 +339,6 @@ class CPAwareScheduler(Scheduler):
         return super().has_requests() or bool(self.active_cp_requests)
     
     # ------------------------------------------------------------------
-    # KV connector meta 覆写(修法A): 前移 CP 字段赋值, 根治时序 bug
-    # ------------------------------------------------------------------
-    def _build_kv_connector_meta(
-        self,
-        connector: "KVConnectorBase_V1",
-        scheduler_output: SchedulerOutput,
-    ) -> "KVConnectorMetadata":
-        # [DyCP] 修法A: base Scheduler.schedule() 在 super().schedule() 内调本方法
-        # (scheduler.py), 早于 cp_aware.schedule() 在 super() 返回后给 CP 字段赋值,
-        # 致 build_connector_meta 读到的 cp_rank / cp_req_id 恒为 dataclass 默认
-        # 值(cp_rank=0, cp_req_id=None -> [])。本覆写改为在调父类 build_connector_meta
-        # 之前, 先用 self.active_cp_requests 与 scheduler_output.num_scheduled_tokens
-        # (此刻已构造完成且为最终值)填好 CP 字段:
-        #   cp_rank               = self.cp_rank(部署时确定, 与 5e6fc3ab 修法b 同源)
-        #   cp_req_id             = 本 step 的长 CP 请求 req_id 列表
-        #                          (旧名 cp_rank_to_req_id, 语义为 CP 请求的 req_id)
-        #   req_id_to_cp_size     = 各 CP 请求被分配到的 cp_ranks
-        #   num_cp_request        = 长 CP 请求数
-        #   cp_rank_scheduled_tokens = 每 req 按 cp_world_size(长)或 1(短)计
-        # 注意: cp_aware.schedule() 末尾仍会再赋一次同样值(为 connector=None 兜底并供
-        # 本步诊断日志使用); 二者计算同源、数值一致, 此处提前赋值不与之冲突。
-        cp_req_ids = [
-            req_id for req_id in scheduler_output.num_scheduled_tokens
-            if req_id in self.active_cp_requests
-        ]
-        scheduler_output.cp_rank = self.cp_rank
-        scheduler_output.num_cp_request = len(cp_req_ids)
-        scheduler_output.cp_req_id = cp_req_ids if cp_req_ids else None
-        req_id_to_cp_size = {
-            req_id: self.active_cp_requests[req_id].cp_ranks
-            for req_id in cp_req_ids
-        }
-        scheduler_output.req_id_to_cp_size = req_id_to_cp_size or None
-        if scheduler_output.cp_rank_scheduled_tokens is None:
-            scheduler_output.cp_rank_scheduled_tokens = {}
-        cp_req_set = set(cp_req_ids)
-        for req_id in scheduler_output.num_scheduled_tokens:
-            scheduler_output.cp_rank_scheduled_tokens[req_id] = (
-                self.cp_world_size if req_id in cp_req_set else 1)
-        return super()._build_kv_connector_meta(connector, scheduler_output)
-
-    # ------------------------------------------------------------------
     # Schedule override: local scheduling + distributed CP consensus
     # ------------------------------------------------------------------
 
@@ -402,11 +356,14 @@ class CPAwareScheduler(Scheduler):
         output = super().schedule()
 
         # Annotate output with CP metadata (needed by workers regardless of sync).
-        # [DyCP] 修法A 说明: 当本 step 有 KV connector 时, 这些字段已由上方
-        # _build_kv_connector_meta 覆写提前填好(供 build_connector_meta 正确消费);
-        # 此处再赋一遍同值, 兼顾 connector=None 的兜底赋值与本步诊断日志
-        # (num_cp_request) 计算, 不改变 connector 已读到的结果。原字段名
-        # cp_rank_to_req_id 已更名为 cp_req_id(语义: CP 请求的 req_id 列表)。
+        # [DyCP] B2 回退说明: 不再以 _build_kv_connector_meta 覆写提前填 CP 字段
+        # (修法A 实测会激活 mooncake 的 reqs_in_batch 过滤③, 致生产者侧把长 CP 请求
+        # 塞入 meta.reqs_in_batch 却不进 requests_to_send, 滞留不清除、锁死 soft-rollback
+        # idle 死循环, 最终 sample_tokens 超时、服务挂, 见 v61)。已移除覆写(B2), 
+        # 这些字段恢复为仅在此处(schedule 末尾)赋值, build_connector_meta 读到的恒为
+        # dataclass 默认值(cp_rank=0/num_cp_request=0/cp_req_id=None->[]), 行为回到
+        # 修法b 之后的稳态(即 v60 的 8/8 全对)。字段名 cp_rank_to_req_id 已更名为
+        # cp_req_id, 仅改名为惰性、无行为影响。TODO 见 output.py cp_req_id 字段注释。
         output.cp_rank = self.cp_rank
         cp_req_ids: list[str] = []
         req_id_to_cp_size: dict[str, list[int]] = {}

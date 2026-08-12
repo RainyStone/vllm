@@ -238,27 +238,36 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
-    # [DyCP] cp_rank / cp_req_id 赋值与消费时序 bug 历史与根治说明:
+    # [DyCP] cp_rank / cp_req_id 赋值与消费时序 bug 历史说明:
     #   根因: base Scheduler.schedule() 在 super().schedule() 内于 scheduler.py
     #   调 build_connector_meta(scheduler_output), 而 cp_aware.schedule() 要等 super()
     #   返回后才给这些字段赋值——赋值晚于消费, connector 读到的恒为 dataclass 默认
     #   值(cp_rank=0, cp_req_id=None -> [])。
     #   修法b(5e6fc3ab 已合入): cp_rank 由 mooncake connector 在 __init__ 自持
     #     self.cp_rank(=data_parallel_rank % dycp_size), 不再读此默认值, 已根治。
-    #   修法A(本次): cp_req_id(旧名 cp_rank_to_req_id)改为由 CPAwareScheduler 覆写
-    #     _build_kv_connector_meta, 在 super().__build_kv_connector_meta 之前提前填
-    #     入, 令 build_connector_meta 读到正确值, 根治时序。两默认值仅作 dataclass
-    #     占位(如 connector 为 None, 仍由 schedule() 末尾兜底赋值)。
+    #   cp_req_id(旧名 cp_rank_to_req_id, 已更名): 故意不根治时序, 保持
+    #     build_connector_meta 读到默认 [] 的惰性状态——此为当前正确行为。
+    #     曾以修法A(覆写 _build_kv_connector_meta 前移赋值)根治, 但实测会激活
+    #     mooncake connector 的 reqs_in_batch 过滤(③), 致生产者(P)侧把长(CP)请求
+    #     塞入 meta.reqs_in_batch 却从不进入 requests_to_send, 请求滞留 worker 的
+    #     reqs_to_process 不清除, 把本可自愈的间歇 soft-rollback 锁死为永久 idle 死循环,
+    #     最终 EngineCore sample_tokens 超时、服务挂(见 v61 日志)。已按方案 B2 回退
+    #     (移除覆写), 行为回到修法A 之前(即 v60 的 8/8 全对)。
+    #   TODO [DyCP] 待根治: ③(reqs_in_batch)/ ②(recv) 两过滤器的 CP 范围限定语义在
+    #     当前配置(P 开 DyCP、D 不开)下靠时序 bug 致惰性才正确; 待将来"D 也开 DyCP /
+    #     P 侧 pull"真正需要 ②③ 生效时, 须连同 cp_req_id 赋值时序、生产者/消费者角色
+    #     区分(start_load_kv 在 P 侧只走发送线程、不应 add_req_to_process)一并重新设计。
     cp_rank: int = 0
 
     num_cp_request: int = 0
 
     req_id_to_cp_size: dict[str, list[int]] | None = None # TODO [DyCP] 根据CPAwareScheduler代码来看，这个变量应该是记录长请求分配到哪些cp rank了，是否重命名成 req_id_to_cp_ranks 较好？？？？
 
-    # 本 step 中所有"跨 cp_rank 的长 CP 请求"的 req_id 列表。由 CPAwareScheduler
-    # 在 _build_kv_connector_meta(修法A)内, 于 base Scheduler 调 build_connector_meta
-    # 之前填入, 根治赋值/消费时序倒置。旧名 cp_rank_to_req_id 易误解为
-    # "cp_rank -> req_id 映射", 实为 CP 请求的 req_id 列表, 故更名为 cp_req_id。
+    # 本 step 中所有"跨 cp_rank 的长 CP 请求"的 req_id 列表。由 cp_aware.schedule()
+    # 末尾赋值(晚于 build_connector_meta 消费, 故 build_connector_meta 读到的恒为
+    # 此默认 None)。字段名由 cp_rank_to_req_id 更名为 cp_req_id(旧名易误解为
+    # "cp_rank -> req_id 映射", 实为 CP 请求的 req_id 列表)。时序 bug 的根治见上方
+    # 注释: 经修法A 实测有副作用, 已按 B2 回退, cp_req_id 保持惰性。
     cp_req_id: list[str] | None = None
 
     none_tokens_in_peer_sched: bool = False
