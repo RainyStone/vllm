@@ -238,14 +238,28 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # [DyCP] cp_rank / cp_req_id 赋值与消费时序 bug 历史与根治说明:
+    #   根因: base Scheduler.schedule() 在 super().schedule() 内于 scheduler.py
+    #   调 build_connector_meta(scheduler_output), 而 cp_aware.schedule() 要等 super()
+    #   返回后才给这些字段赋值——赋值晚于消费, connector 读到的恒为 dataclass 默认
+    #   值(cp_rank=0, cp_req_id=None -> [])。
+    #   修法b(5e6fc3ab 已合入): cp_rank 由 mooncake connector 在 __init__ 自持
+    #     self.cp_rank(=data_parallel_rank % dycp_size), 不再读此默认值, 已根治。
+    #   修法A(本次): cp_req_id(旧名 cp_rank_to_req_id)改为由 CPAwareScheduler 覆写
+    #     _build_kv_connector_meta, 在 super().__build_kv_connector_meta 之前提前填
+    #     入, 令 build_connector_meta 读到正确值, 根治时序。两默认值仅作 dataclass
+    #     占位(如 connector 为 None, 仍由 schedule() 末尾兜底赋值)。
     cp_rank: int = 0
 
     num_cp_request: int = 0
 
     req_id_to_cp_size: dict[str, list[int]] | None = None # TODO [DyCP] 根据CPAwareScheduler代码来看，这个变量应该是记录长请求分配到哪些cp rank了，是否重命名成 req_id_to_cp_ranks 较好？？？？
 
-    # req_ids will be processed in this cp rank
-    cp_rank_to_req_id: list[str] | None = None
+    # 本 step 中所有"跨 cp_rank 的长 CP 请求"的 req_id 列表。由 CPAwareScheduler
+    # 在 _build_kv_connector_meta(修法A)内, 于 base Scheduler 调 build_connector_meta
+    # 之前填入, 根治赋值/消费时序倒置。旧名 cp_rank_to_req_id 易误解为
+    # "cp_rank -> req_id 映射", 实为 CP 请求的 req_id 列表, 故更名为 cp_req_id。
+    cp_req_id: list[str] | None = None
 
     none_tokens_in_peer_sched: bool = False
 
