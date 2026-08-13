@@ -478,34 +478,36 @@ class CPAwareScheduler(Scheduler):
                 continue
             logger.debug(f"[DYCP] Soft rollback triggered for req {req_id}.")
             if req_id in output.num_scheduled_tokens:
-                logger.info(
-                    "[DYCP] Soft rollback req=%s (was SCHEDULED on this rank,"
-                    " num_computed=%d)",
-                    req_id,
-                    self.active_cp_requests[req_id].num_computed_tokens,
-                )
+                # [DyCP] 设计语义: 长请求在子组某个 dp 本拍未调度到时, 本拍调度到
+                # 它的 dp 仅把该请求从本次 scheduler_output 剔除, 已计算的 KV 与
+                # prefill 进度(num_computed_tokens)保持不变。故本分支只做"剔除本次
+                # 调度结果", 不释放 KV、不重置进度、不降级状态:
+                #   - pop num_scheduled_tokens 并扣减 total_num_scheduled_tokens;
+                #     _remove_req_from_output 同步清理 scheduled_new_reqs /
+                #     scheduled_cached_reqs(new_block_ids 等) / cp_rank_scheduled_tokens
+                #     / cp_req_id / req_id_to_cp_size / num_cp_request /
+                #     scheduled_spec_decode_tokens 等全部 output 侧计数。
+                #   - 不调用 kv_cache_manager.free(): 那会释放该请求全部历史块,
+                #     违背"已计算的 KV 不动", 且会破坏正在向 D 传输的 KV。
+                #   - 不重置 num_computed_tokens、不把 status 降级为 WAITING、不移出
+                #     running: prefill 进度与状态原样保留, 下一拍续算即可。
+                # 本拍为该请求新分配的尾部块(尚未写入, soft_rollback 发生在
+                # execute_model 之前)予以保留: 它们不属"已计算 KV", 下一拍真正执行
+                # 时写入并复用。FullAttentionManager 对 running 请求的
+                # get_num_blocks_to_allocate / allocate_new_blocks 在块已足够时均
+                # max(...,0) 钳到 0, 故保留尾部块不触发负分配或断言; attention 的
+                # causal mask 只读 num_computed..num_computed+num_new, 不脏读。
                 num_tokens = output.num_scheduled_tokens.pop(req_id)
                 output.total_num_scheduled_tokens -= num_tokens
                 self._remove_req_from_output(output, req_id)
-
                 request = self.active_cp_requests[req_id]
-                self.kv_cache_manager.free(request)   # TODO [DyCP] soft rollback 为什么要释放所有kv cache，这样如果某个请求soft rollback，之前计算的所有KV Cache都没了????开不开chunk prefill是否有区别
-
-                request.status = RequestStatus.WAITING
-                # Must reset to 0 even though the intent of soft rollback is to
-                # preserve prefill progress. kv_cache_manager.free() releases
-                # all blocks for this request. If num_computed_tokens were left
-                # at its historical value (e.g. 50K), the base scheduler would
-                # take the `else` branch (the KVTransfer path) on the next step
-                # and use that stale value directly, yielding num_new_tokens=0
-                # and hitting `assert num_new_tokens > 0`. Resetting to 0 forces
-                # the base scheduler to call get_computed_blocks() instead, which
-                # re-hits the prefix cache and recovers the same progress without
-                # redundant computation.
-                request.num_computed_tokens = 0
-                if request in self.running:
-                    self.running.remove(request)
-                self.waiting.prepend_request(request)
+                logger.info(
+                    "[DYCP] Soft rollback req=%s (was SCHEDULED on this rank, "
+                    "num_computed=%d) -> 仅剔除本次 output, 保留已算 KV 与进度, "
+                    "status 保持 RUNNING",
+                    req_id,
+                    request.num_computed_tokens,
+                )
             else:
                 logger.info(
                     "[DYCP] Soft rollback req=%s (was NOT_SCHEDULED on this"
