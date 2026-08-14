@@ -406,7 +406,18 @@ class CPAwareScheduler(Scheduler):
         status: list[int] = []
         finished_ids: list[str] = []
         for req_id in active_ids:
-            if req_id not in self.requests:
+            req = self.active_cp_requests[req_id]
+            # [DyCP] 根因修复: CP 请求 finish 后必须退出 active_cp_requests,
+            # 否则 has_requests() 恒真、引擎空转、最终 NPU 看门狗超时(v62/v60)。
+            # 原仅以 req_id not in self.requests 判"本 rank 已完成", 但 P 端
+            # mooncake producer 对 CP prefill 请求 finished_sending 不上报,
+            # delay_free 永不释放、请求永不移出 self.requests, active_cp 永不排空。
+            # 修正: 增加 req.is_finished() 作为"CP 工作已完成"判据, 与 self.requests
+            # 的 KV 块释放生命周期解耦。is_finished() 由 super().update_from_output
+            # 在各 cp_rank 同一步同步置位(共识已保证同组同伐), 对称安全; 仍以
+            # SCHEDULED 上报、sync 后统一 pop, 保留"一 rank 先完成不拖 peer"的兼容
+            # 语义。保留 not in self.requests 分支兼容 D 端/请求被实际移除的既有路径。
+            if (req_id not in self.requests) or req.is_finished():
                 # This rank already finished; report SCHEDULED so the peer is
                 # not held back. Clean up after the sync.
                 s = SCHEDULED
@@ -421,7 +432,6 @@ class CPAwareScheduler(Scheduler):
             else:
                 s = NOT_SCHEDULED
                 s_str = "NOT_SCHEDULED"
-            req = self.active_cp_requests[req_id]
             logger.info(
                 "[DYCP] CP sync rank=%d req=%s local_status=%s "
                 "num_computed=%d in_requests=%s",
