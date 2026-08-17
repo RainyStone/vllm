@@ -104,7 +104,17 @@ class CPSyncProtocol:
         if num_slots == 0:
             return [], [], []
 
-        self._confirm_tensor.zero_()
+        # [DyCP] 根因修复(v77/v78): _confirm_tensor 初始化从 zero_(=0=PREEMPTED)
+        # 改为 fill_(NOT_SCHEDULED=1)。当子组两端 add_request 异步到达、本拍
+        # active_ids 数量不一致(CP 请求广播经 async engine 队列投递,两端收到
+        # 时刻有微秒差)时, 短端(num_slots 较小)只填到自己的 num_slots, 尾部
+        # 超出槽位保持初始值。若初始为 0(PREEMPTED), all_reduce MIN 按槽位光标
+        # 对齐会把长端同位置真 req 的 min 拉到 0 -> 误判 hard_rollback -> 释放正
+        # 在用/正在传 D 的 KV 块 -> Worker KeyError(v77)/ 重排多占拍致全 DP
+        # collective 错位卡死(v78)。初始为 1(NOT_SCHEDULED) 则最差只拉到 1
+        # (soft_rollback), 不误触发 hard_rollback。与 sync_empty 早已采用的
+        # fill_(NOT_SCHEDULED) 语义对齐, 消除主路径与空拍路径的自相矛盾。
+        self._confirm_tensor.fill_(NOT_SCHEDULED)
         for i in range(num_slots):
             self._confirm_tensor[i] = status[i]
 
