@@ -1903,8 +1903,24 @@ class DPEngineCoreProc(EngineCoreProc):
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
+            # [DyCP] 根因修复(v79): bl_skip(all idle 分支, continue)在 DyCP 模式下禁用。
+            # 根因: bl_skip 走 continue 既不 increment step_counter, 又跳过
+            # _has_global_unfinished_reqs 里的 sync_dp_state(全 DP all_reduce)。
+            # 当某子组(如 sub1)本拍 had_reqs=True 正常执行并 inc step_counter、走
+            # sync_dp_state, 而另一子组(如 sub0)本拍 had_reqs=False 走 bl_skip 时:
+            #   1) sub0 step_counter 不增量 -> 与 sub1 step_counter 错位累积;
+            #   2) sub0 缺席全 DP sync_dp_state all_reduce -> collective 不配对 ->
+            #      collective-type-mismatch 死锁(sub1 stepcnt 先到 32 单边触发、sub0
+            #      缺席, v79 实测 sub1 比 sub0 早 2 拍到 32, 卡死 4 分钟)。
+            # DyCP 要 lockstep(每拍全 DP 同步步进), bl_skip 破坏它。禁用后 DyCP idle
+            # 本拍走向: 不 bl_skip -> 进 dycp_enabled 分支(空拍, 不补 dummy) ->
+            # _has_global_unfinished_reqs(inc step_counter + 每32拍 sync_dp_state) ->
+            # sync 返回全 DP 是否真 idle -> 真 idle 则停循环 + reset step_counter。
+            # 非 DyCP 维持原 bl_skip 逻辑不变(条件分支隔离, 不影响原有特性)。
+            dycp_enabled = getattr(self, "dycp_group", None) is not None
             if not executed:
-                if not local_unfinished_reqs and not self.engines_running:
+                if (not local_unfinished_reqs and not self.engines_running
+                        and not dycp_enabled):
                     # All engines are idle.
                     continue
 
@@ -1917,9 +1933,9 @@ class DPEngineCoreProc(EngineCoreProc):
                 # 空 output 的 worker DUMMY-A), 故每轮已在 worker 侧发过一次 metadata
                 # all_reduce。此处不再补 execute_dummy_batch(同步阻塞, 无 future),
                 # 否则本拍双发 AR -> metadata AR 计数错位 -> 全 DP collective-type-
-                # mismatch 死锁。非 DyCP 路径维持原 if not had_reqs 补 dummy 逻辑不变。
-                _dycp_bl = getattr(self, "dycp_group", None) is not None
-                if _dycp_bl:
+                # mismatch 死锁。仅保留 engines_running=False 的 continue(全 DP idle
+                # 反馈, 见上方分支)。非 DyCP 路径维持原 if not had_reqs 补 dummy 逻辑不变。
+                if dycp_enabled:
                     pass  # DyCP: 0-token/空拍已由 DUMMY-A 发 AR, 不补 execute_dummy_batch
                 elif not had_reqs:
                     self.execute_dummy_batch()
