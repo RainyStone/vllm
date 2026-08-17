@@ -480,8 +480,32 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule()
+        # [DyCP] 阶段1: DyCP 开启时(dycp_group 非空, 即 P 端 dycp_size>1), 每轮都进
+        # schedule 分支: 有请求则正常 schedule, 无请求则产空 SchedulerOutput(走
+        # worker DUMMY-A 发 metadata AR), 保证子组两端每轮都提交一次 execute_model、
+        # 提交节奏对齐, 从根上消除子组两端某拍一进 dycp all_gather 一不进的错位死锁。
+        # 非 DyCP(D 端 dycp_size=1 / 非 DP 单引擎) dycp_group 为 None -> 维持原
+        # has_requests 门控, 不影响原有特性(条件分支隔离)。
+        dycp_enabled = getattr(self, "dycp_group", None) is not None
+        if self.scheduler.has_requests() or dycp_enabled:
+            scheduler_output = (
+                self.scheduler.schedule()
+                if self.scheduler.has_requests()
+                else SchedulerOutput.make_empty()
+            )
+            # [DyCP] 阶段1修: 空 output(make_empty)不经 schedule, 缺
+            # kv_connector_metadata(默认 None)。worker 在 0-token + kv 连接器
+            # 路径(kv_connector_no_forward -> _get_kv_connector_output)
+            # 会 assert kv_connector_metadata is not None, 否则 idle rank 崩(v73 DP2)。
+            # 故空 output 须补 build_connector_meta, 使其与 schedule 出的 0-token
+            # output(CP 空转拍, schedule 尾部填 connector_metadata)语义一致。
+            if (not self.scheduler.has_requests()
+                    and getattr(self.scheduler, "connector", None) is not None):
+                scheduler_output.kv_connector_metadata = (
+                    self.scheduler._build_kv_connector_meta(
+                        self.scheduler.connector, scheduler_output
+                    )
+                )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -1888,7 +1912,16 @@ class DPEngineCoreProc(EngineCoreProc):
                 # idle rank keeping collective cadence). When execute_model
                 # already ran (had_reqs True), the per-step metadata all_reduce
                 # was already emitted -- skip the dummy (see comment above).
-                if not had_reqs:
+                # [DyCP] 阶段1: DyCP 开启时(dycp_group 非空), step_with_batch_queue
+                # 每轮都 schedule 并提交一次 execute_model(含请求走真前向、无请求走
+                # 空 output 的 worker DUMMY-A), 故每轮已在 worker 侧发过一次 metadata
+                # all_reduce。此处不再补 execute_dummy_batch(同步阻塞, 无 future),
+                # 否则本拍双发 AR -> metadata AR 计数错位 -> 全 DP collective-type-
+                # mismatch 死锁。非 DyCP 路径维持原 if not had_reqs 补 dummy 逻辑不变。
+                _dycp_bl = getattr(self, "dycp_group", None) is not None
+                if _dycp_bl:
+                    pass  # DyCP: 0-token/空拍已由 DUMMY-A 发 AR, 不补 execute_dummy_batch
+                elif not had_reqs:
                     self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
