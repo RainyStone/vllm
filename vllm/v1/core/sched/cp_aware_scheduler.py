@@ -527,11 +527,25 @@ class CPAwareScheduler(Scheduler):
                 output.total_num_scheduled_tokens -= num_tokens
                 self._remove_req_from_output(output, req_id)
                 request = self.active_cp_requests[req_id]
+                # [DyCP] 根因修复: 回退本拍 _update_after_schedule 乐观推进的
+                # num_computed_tokens。soft_rollback 发生在 execute_model 之前(本拍
+                # CP 段实际未执行), num_computed 的本拍推进(num_scheduled)是调度乐观值
+                # 而非真实计算。若不回退: base 下拍 num_new_tokens = num_tokens -
+                # num_computed = 0 永远 SKIP, CP 长请求(prefill)永不重排、永不 execute,
+                # 而 max_tokens=1 的 sample 恰在 prefill execute 拍完成, 故 sample 永不
+                # 做 -> CP 请求永不 finish -> active_cp 排不空 -> idle 死循环卡死; 两端
+                # 能否排出 sample 受 async 时序随机化, 致不对称 finish 撞 pop v75。
+                # 回退只减本拍 num_scheduled, 保留之前拍真实计算的进度; 物理 KV 块不
+                # 释放(已算 KV 不动, 语义不变, 不调用 kv_cache_manager.free), 与
+                # _degrade_cp_from_output 的回退逻辑对齐。
+                request.num_computed_tokens = max(
+                    0, request.num_computed_tokens - num_tokens)
                 logger.info(
                     "[DYCP] Soft rollback req=%s (was SCHEDULED on this rank, "
-                    "num_computed=%d) -> 仅剔除本次 output, 保留已算 KV 与进度, "
-                    "status 保持 RUNNING",
+                    "num_computed %d->%d) -> 剔除本次 output + 回退本拍乐观推进的 "
+                    "num_computed(execute 前未真算), 保留已算物理 KV 块, status RUNNING",
                     req_id,
+                    request.num_computed_tokens + num_tokens,
                     request.num_computed_tokens,
                 )
             else:
