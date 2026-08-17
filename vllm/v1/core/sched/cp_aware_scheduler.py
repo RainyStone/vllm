@@ -479,6 +479,22 @@ class CPAwareScheduler(Scheduler):
     ) -> SchedulerOutput:
         """Remove from output and requeue for next step."""
         for req_id in rollback_ids:
+            # [DyCP] v75 根因修复: 长请求在本 rank 已 finish 时, schedule() 上方
+            # 的 finished 清理已将其从 active_cp_requests 移除; 但若此时共识因
+            # peer 本拍未调度该请求而把它列入 soft_rollback_ids, 则本 rank 既无
+            # active_cp 条目、本次 output 也未含该请求(finished 不再调度), 直接
+            # 跳过即可。否则下方 SCHEDULED/NOT_SCHEDULED 两分支 self.
+            # active_cp_requests[req_id] 会 KeyError(两端长请求 finish 但被
+            # soft_rollback, 上方 finished 清理先 pop 致此处空访 -> EngineCore 崩
+            # -> worker 死 -> 对端 metadata AR connection closed by peer 级联)。
+            if req_id not in self.active_cp_requests:
+                self.prev_step_scheduled_req_ids.discard(req_id)
+                logger.info(
+                    "[DYCP] Soft rollback skip req=%s on rank %d: not in "
+                    "active_cp_requests (already finished/removed by cleanup)",
+                    req_id, self.cp_rank,
+                )
+                continue
             # If the request has already finished on this rank (peer completed
             # one step earlier and update_from_output cleaned self.requests),
             # skip the rollback mechanics and just drop it from active tracking.
