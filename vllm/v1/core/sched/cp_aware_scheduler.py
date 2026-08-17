@@ -655,6 +655,100 @@ class CPAwareScheduler(Scheduler):
             del output.scheduled_spec_decode_tokens[req_id]
 
     # ------------------------------------------------------------------
+    # [DyCP 阶段2] 执行层 CP 对齐: 根治 async batch_queue 提交错位死锁
+    # ------------------------------------------------------------------
+
+    def align_execute_cp(self, scheduler_output: SchedulerOutput) -> bool:
+        """[DyCP 阶段2] 执行层 CP 对齐协商 + 必要时降级。
+
+        根因(已 v72 取证坐实): schedule() 末尾的 CP 共识
+        (cp_sync.sync_schedule_confirm, 子组 gloo all_reduce MIN)只对齐"调度层"决策
+        (同组同是否调度某 CP 请求), 但 step_with_batch_queue 的 async batch_queue 使子组
+        两端"提交节奏"独立错位(某 DP 可早提交若干拍, v72 中 DP1 领先 DP0 两拍), 导致两端
+        在同一 execute_model 拍上 num_cp_request 不一致: 一端含长(进 mla_cp 的 dycp
+        all_gather, hccl 子组原语)、一端不含长(不进) -> hccl all_gather 不配对 -> 含长端
+        worker 同步阻塞、挂死整个 worker 进程(worker 串行执行) -> 经全 DP metadata
+        all_reduce(gloo, execute_model 内每拍发)放大成全 DP 互锁。
+
+        修复原理: 在 execute_model 提交前(step_with_batch_queue 内, schedule 之后)插入
+        一次子组 gloo all_reduce MIN(local_has_cp)。规则:
+          - 两端同含长(peer_min=1): 正常提交(CP 共识已对齐, 两端同进 all_gather);
+          - 两端同不含长(local=0): 正常提交(两端都不进 all_gather);
+          - 一端含长一端不含长(local=1 且 peer_min=0): 含长端降级(剔除本拍 CP 请求并
+            回退 num_computed_tokens), 降级后两端 num_cp_request 同 0, 都不进 all_gather。
+        此协商是子组 gloo 同步原语, 天然把两端提交节奏锁成 lockstep(子组内 submit 1:1
+        配对: 一端 negotiate #K 必须等对端 negotiate #K 才返回), 同时消除"提交错位"与
+        "num_cp 不配对"两个死锁源。
+
+        与共识层 _soft_rollback 的区别: _soft_rollback 用于"CP 共识后本 rank 未分到段"的
+        语义, 故意不回退 num_computed_tokens(已算 KV 不动, 下拍续算下一段); 本方法用于
+        "execute 前 peer 无长、本端须降级", 此时 CP 段尚未计算(super().schedule() 内的
+        _update_after_schedule 已推进 num_computed_tokens 但 worker 还没跑), 必须回退
+        num_computed_tokens, 否则下拍会跳段、KV 错位。降级只动 scheduler_output 侧计数 +
+        num_computed_tokens 回退, 不释放 KV 块、不降级 status(保持 RUNNING)、不移出
+        running(下拍续算同段), 与 _soft_rollback 的 KV/状态保留语义一致。
+
+        mooncake meta 安全性: kv_connector_metadata 由 base schedule() 在 super() 内依
+        "调度时刻"已构建; P 端 dycp>1 时 build_connector_meta 读 cp_req_id 为默认 None->[]
+        (cp_aware 在 super 之后才赋 cp_req_id), 故 meta.reqs_in_batch 恒空; 且被降级的
+        CP 正在 prefill、尚未 finish, 不在 _reqs_need_send 中, 故不在 meta.requests_to_send。
+        综上, 剔除 output 侧 CP 计数不脏读已构建的 meta, 无需重建/补丁。
+
+        非 DyCP(cp_sync is None, 即 D 端 dycp_size=1 / 非 DP)直接返回, 零影响。
+        返回 True 表示本拍发生了降级(供日志/调用方)。
+        """
+        if self.cp_sync is None:
+            return False
+
+        local_has_cp = 1 if (scheduler_output.num_cp_request or 0) > 0 else 0
+        flag = torch.tensor([local_has_cp], dtype=torch.int32)
+        # 子组 gloo all_reduce MIN: peer_min=1 当且仅当子组所有端本拍都含长。
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN,
+            group=self.cp_sync.dycp_group,
+        )
+        peer_min = int(flag.item())
+
+        if local_has_cp == 1 and peer_min == 0:
+            # 本端含长、子组内至少一端不含长 -> 降级, 剔除本拍 CP 请求并回退进度。
+            return self._degrade_cp_from_output(scheduler_output)
+        return False
+
+    def _degrade_cp_from_output(
+        self, output: SchedulerOutput
+    ) -> bool:
+        """[DyCP 阶段2] execute 前降级: 剔除本拍 output 全部 CP 请求并回退 prefill 进度。
+
+        语义/根因见 align_execute_cp。与 _soft_rollback 的关键差异: 本方法回退
+        num_computed_tokens(CP 段未计算, 不回退会跳段)。KV 块 / status(保持 RUNNING) /
+        running 队列原样保留(下拍续算同段), 与 _soft_rollback 一致。
+        """
+        degraded_ids: list[str] = []
+        # 本拍 output 中的 CP 请求 = active_cp 且在本拍 num_scheduled_tokens 中。
+        for req_id in list(output.num_scheduled_tokens.keys()):
+            if req_id not in self.active_cp_requests:
+                continue
+            # 复用 _soft_rollback 的 output 剔除顺序: 先 pop num_scheduled_tokens +
+            # 扣 total(_remove_req_from_output 不动这两项), 再清其余 output 侧计数。
+            num_scheduled = output.num_scheduled_tokens.pop(req_id)
+            output.total_num_scheduled_tokens -= num_scheduled
+
+            req = self.active_cp_requests.get(req_id)
+            # 回退 prefill 进度: _update_after_schedule 已在 super().schedule() 内推进,
+            # 但本拍 CP 段尚未执行(execute 前), 不回退会跳段、KV 错位。
+            if req is not None and req_id in self.requests:
+                req.num_computed_tokens = max(
+                    0, req.num_computed_tokens - num_scheduled
+                )
+
+            self._remove_req_from_output(output, req_id)
+            # 下拍按"新续算"处理, 避免基类 _make_cached_request_data 的
+            # assert not scheduled_in_prev_step。
+            self.prev_step_scheduled_req_ids.discard(req_id)
+            degraded_ids.append(req_id)
+        return len(degraded_ids) > 0
+
+    # ------------------------------------------------------------------
     # Update from output: handle CP request completion
     # ------------------------------------------------------------------
 

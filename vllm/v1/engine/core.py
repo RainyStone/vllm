@@ -506,6 +506,16 @@ class EngineCore:
                         self.scheduler.connector, scheduler_output
                     )
                 )
+            # [DyCP 阶段2] 执行层 CP 对齐协商: 保证子组两端每拍 execute 的
+            # num_cp_request 一致(同 0 或同 >0), 根治 async batch_queue 提交错位致
+            # dycp all_gather(hccl 子组)不配对的死锁。根因/修复原理详见
+            # CPAwareScheduler.align_execute_cp。仅在 DyCP 开启(dycp_group 非空)时调用;
+            # 协商(子组 gloo all_reduce MIN)+ 降级(回退 num_computed_tokens)全在
+            # scheduler 侧完成, 此处仅条件分支调用。非 DyCP 不进, 零影响(条件分支隔离)。
+            # real schedule 与 make_empty 空拍都会调到, 保证子组两端每拍都参与协商
+            # (gloo 阻塞同步, 天然把子组 submit 锁成 lockstep 配对)。
+            if dycp_enabled and hasattr(self.scheduler, "align_execute_cp"):
+                self.scheduler.align_execute_cp(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
