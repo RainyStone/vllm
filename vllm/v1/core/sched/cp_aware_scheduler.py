@@ -81,60 +81,79 @@ class CPSyncProtocol:
 
         # Pre-allocated tensor for post-schedule all-reduce (avoids per-call
         # allocation on the hot path).
+        # [DyCP] 共识张量布局(33 元):
+        #   索引 [0]           : has_cp 固定标志槽。恒存在、不随 num_slots 截断。
+        #                        填 1 表示本拍本 rank 调度到了 CP 长请求, 填 0 表示没有。
+        #                        all_reduce MIN 后, 该槽的 min = subgroup_all_schedule_cp_request
+        #                        (=1 当且仅当子组所有端本拍都排了 CP 长请求; =0 表示至少一端没排)。
+        #                        用于驱动阶段2降级: 本端有长但子组不全有长 -> 降级对齐两端 num_cp。
+        #   索引 [1 .. _MAX_CP_SYNC_SLOTS]: CP 请求状态槽(SCHEDULED/NOT_SCHEDULED/PREEMPTED), 语义不变。
+        # has_cp 固定放第 0 槽、不截断, 保证空拍(无 active_cp)两端仍同形状(all_reduce 全 33 元),
+        # 根治(共识仅忙拍调、空拍不调)导致的 32元↔1元 错配崩溃(v81)与忙端 hang。
         self._confirm_tensor = torch.zeros(
-            _MAX_CP_SYNC_SLOTS, dtype=torch.int32, device="cpu"
+            _MAX_CP_SYNC_SLOTS + 1, dtype=torch.int32, device="cpu"
         )
 
     def sync_schedule_confirm(
         self,
         active_ids: list[str],
         status: list[int],
-    ) -> tuple[list[str], list[str], list[str]]:
-        """Post-schedule consensus using three-state encoding.
+        local_has_cp: int,
+    ) -> tuple[list[str], list[str], list[str], int]:
+        """Post-schedule consensus using three-state encoding, 合并阶段2协商.
+
+        把"CP 请求状态共识"(原 32 槽)与"阶段2 是否含长协商"(原 align_execute_cp
+        的 1 元 all_reduce)合并成本方法内的**一次** all_reduce, 根治两者抢同一
+        dycp_group、形状 32≠1 错配崩溃(v81)及"共识仅忙拍调、空拍不调"的忙端 hang.
 
         Args:
             active_ids: Active CP request IDs (sorted, identical across ranks).
             status: Per-request status on this rank
-                    (SCHEDULED=2 / NOT_SCHEDULED=1 / PREEMPTED=0).
+                    (SCHEDULED=2 / NOT_SCHEDULED=1 / PREEMPTED=0)。
+            local_has_cp: 本拍本 rank 是否调度到 CP 长请求(1=是, 0=否)。
+                          写入固定槽 [0], all_reduce MIN 后该槽即阶段2协商结果。
 
         Returns:
-            (confirmed_ids, soft_rollback_ids, hard_rollback_ids)
+            (confirmed_ids, soft_rollback_ids, hard_rollback_ids,
+             subgroup_all_schedule_cp_request)
+            其中 subgroup_all_schedule_cp_request = 子组所有端 local_has_cp 的 MIN:
+              =1 当且仅当子组所有端本拍都排了 CP 长请求(两端都含长);
+              =0 表示至少一端本拍没排 CP 长请求(含长端须降级对齐)。
         """
         num_slots = min(len(active_ids), _MAX_CP_SYNC_SLOTS) # TODO [DyCP] 不同rank上，active_ids是一致的吗？不一致是否会有影响
-        if num_slots == 0:
-            return [], [], []
 
-        # [DyCP] 根因修复(v77/v78): _confirm_tensor 初始化从 zero_(=0=PREEMPTED)
-        # 改为 fill_(NOT_SCHEDULED=1)。当子组两端 add_request 异步到达、本拍
-        # active_ids 数量不一致(CP 请求广播经 async engine 队列投递,两端收到
-        # 时刻有微秒差)时, 短端(num_slots 较小)只填到自己的 num_slots, 尾部
-        # 超出槽位保持初始值。若初始为 0(PREEMPTED), all_reduce MIN 按槽位光标
-        # 对齐会把长端同位置真 req 的 min 拉到 0 -> 误判 hard_rollback -> 释放正
-        # 在用/正在传 D 的 KV 块 -> Worker KeyError(v77)/ 重排多占拍致全 DP
-        # collective 错位卡死(v78)。初始为 1(NOT_SCHEDULED) 则最差只拉到 1
-        # (soft_rollback), 不误触发 hard_rollback。与 sync_empty 早已采用的
-        # fill_(NOT_SCHEDULED) 语义对齐, 消除主路径与空拍路径的自相矛盾。
+        # [DyCP] 根因修复(v77/v78): CP 槽([1..32])初始填充 NOT_SCHEDULED(1) 而非
+        # PREEMPTED(0)。短端 active_ids 较少时尾部超出槽位保持初始值, 若为 0 则
+        # all_reduce MIN 会把长端同位置真 req 的 min 拉到 0 -> 误判 hard_rollback ->
+        # 释放正在用/正在传 D 的 KV 块 -> Worker KeyError(v77)/ 卡死(v78)。
+        # has_cp 固定槽 [0] 单独写 local_has_cp(不随 num_slots 截断)。
         self._confirm_tensor.fill_(NOT_SCHEDULED)
+        self._confirm_tensor[0] = local_has_cp
         for i in range(num_slots):
-            self._confirm_tensor[i] = status[i]
+            self._confirm_tensor[i + 1] = status[i]
 
+        # ★ 关键改: 空拍(num_slots==0)不再提前 return —— 仍走 all_reduce 全 33 元。
+        # 否则忙端共识(33元)等不到空端 -> hang; 且原 align 的 1 元与共识 32 元错配 -> 崩。
         torch.distributed.all_reduce(
             self._confirm_tensor,
             op=torch.distributed.ReduceOp.MIN,
             group=self.dycp_group,
         )
 
+        subgroup_all_schedule_cp_request = int(self._confirm_tensor[0].item())
+
         confirmed: list[str] = []
         soft_rollback: list[str] = []
         hard_rollback: list[str] = []
-        for i in range(num_slots):
-            val = self._confirm_tensor[i].item()
-            if val >= SCHEDULED:
-                confirmed.append(active_ids[i])
-            elif val >= NOT_SCHEDULED:
-                soft_rollback.append(active_ids[i])
-            else:
-                hard_rollback.append(active_ids[i])
+        if num_slots > 0:
+            for i in range(num_slots):
+                val = self._confirm_tensor[i + 1].item()
+                if val >= SCHEDULED:
+                    confirmed.append(active_ids[i])
+                elif val >= NOT_SCHEDULED:
+                    soft_rollback.append(active_ids[i])
+                else:
+                    hard_rollback.append(active_ids[i])
 
         if soft_rollback or hard_rollback:
             logger.info(
@@ -146,7 +165,7 @@ class CPSyncProtocol:
                 self.cp_rank,
             )
 
-        return confirmed, soft_rollback, hard_rollback
+        return confirmed, soft_rollback, hard_rollback, subgroup_all_schedule_cp_request
     
     def sync_empty(self) -> None:
         """Participate in the sync all_reduce with no active CP requests.
@@ -402,15 +421,24 @@ class CPAwareScheduler(Scheduler):
             self.cp_rank, self.cp_world_size, output.num_cp_request, num_dp_req,
         )
 
+        # 本拍本 rank 是否调度到 CP 长请求(1=是, 0=否)。
+        # 用于合并共识 sync_schedule_confirm 的 has_cp 固定槽 [0]: all_reduce MIN 后
+        # 该槽 = subgroup_all_schedule_cp_request(子组是否所有端本拍都含长),
+        # 驱动下方阶段2降级。须在 CP 元数据标注(num_cp_request 已赋)之后计算。
+        local_has_cp = 1 if output.num_cp_request > 0 else 0
+
         # No sync needed (single DP or test environment without dp_group).
         if self.cp_sync is None:
             self._preempted_this_step.clear()
             return output
 
-        if not self.active_cp_requests:
-            self._preempted_this_step.clear()
-            return output
-
+        # [DyCP] 合并修复(v81 根因): 不再因"本端无 active_cp"就提前 return。
+        # 空拍也必须进 sync_schedule_confirm 的 33 元 all_reduce: 否则忙端
+        # (有 active_cp)的共识会一直等空端 -> hang; 且原"空拍跳过共识、忙端调
+        # 共识(32元)"配合 align_execute_cp 的独立 1 元 all_reduce, 形状 32!=1
+        # 错配抢同一 dycp_group -> gloo Connection reset 崩(v81)。现两者合并成
+        # schedule() 内一次 33 元 all_reduce, 空拍端 has_cp=0 + CP 槽全
+        # NOT_SCHEDULED, 与忙端同形状配对, 根治 hang 与崩。
         # Build per-request status vector for the all_reduce.
         active_ids = sorted(self.active_cp_requests.keys())
         status: list[int] = []
@@ -450,8 +478,8 @@ class CPAwareScheduler(Scheduler):
             )
             status.append(s)
 
-        confirmed, soft_rollback_ids, hard_rollback_ids = (
-            self.cp_sync.sync_schedule_confirm(active_ids, status)
+        confirmed, soft_rollback_ids, hard_rollback_ids, subgroup_all_schedule_cp_request = (
+            self.cp_sync.sync_schedule_confirm(active_ids, status, local_has_cp)
         )
 
         # Clean up requests that finished on this rank before the sync.
@@ -465,6 +493,16 @@ class CPAwareScheduler(Scheduler):
                     req_id, self.cp_rank,
                 )
 
+        # [DyCP 阶段2] 协商降级: 本端含长(local_has_cp=1)但子组不全含长
+        # (subgroup_all_schedule_cp_request=0) -> 全量剔除本拍 CP 请求并回退
+        # num_computed(降级), 对齐子组两端 num_cp 同 0(都不进 dycp all_gather)。
+        # 降级插在 soft/hard_rollback 之前且互斥安全: 降级场景下至少一端空拍
+        # (其 has_cp=0、CP 槽全 NOT_SCHEDULED), 该端不会投 PREEMPTED, 故
+        # hard_rollback_ids 为空; soft_rollback_ids 含本端全部 cp, 但已被降级从
+        # output 剔除(num_scheduled_tokens 已 pop), _soft_rollback 的 SCHEDULED
+        # 分支判 not in num_scheduled_tokens 走 else 无害空转, 不重复回退。
+        if local_has_cp == 1 and subgroup_all_schedule_cp_request == 0:
+            self._degrade_cp_from_output(output)
         if soft_rollback_ids:
             output = self._soft_rollback(output, soft_rollback_ids)
         if hard_rollback_ids:
@@ -514,49 +552,17 @@ class CPAwareScheduler(Scheduler):
                 continue
             logger.debug(f"[DYCP] Soft rollback triggered for req {req_id}.")
             if req_id in output.num_scheduled_tokens:
-                # [DyCP] 设计语义: 长请求在子组某个 dp 本拍未调度到时, 本拍调度到
-                # 它的 dp 仅把该请求从本次 scheduler_output 剔除, 已计算的 KV 与
-                # prefill 进度(num_computed_tokens)保持不变。故本分支只做"剔除本次
-                # 调度结果", 不释放 KV、不重置进度、不降级状态:
-                #   - pop num_scheduled_tokens 并扣减 total_num_scheduled_tokens;
-                #     _remove_req_from_output 同步清理 scheduled_new_reqs /
-                #     scheduled_cached_reqs(new_block_ids 等) / cp_rank_scheduled_tokens
-                #     / cp_req_id / req_id_to_cp_size / num_cp_request /
-                #     scheduled_spec_decode_tokens 等全部 output 侧计数。
-                #   - 不调用 kv_cache_manager.free(): 那会释放该请求全部历史块,
-                #     违背"已计算的 KV 不动", 且会破坏正在向 D 传输的 KV。
-                #   - 不重置 num_computed_tokens、不把 status 降级为 WAITING、不移出
-                #     running: prefill 进度与状态原样保留, 下一拍续算即可。
-                # 本拍为该请求新分配的尾部块(尚未写入, soft_rollback 发生在
-                # execute_model 之前)予以保留: 它们不属"已计算 KV", 下一拍真正执行
-                # 时写入并复用。FullAttentionManager 对 running 请求的
-                # get_num_blocks_to_allocate / allocate_new_blocks 在块已足够时均
-                # max(...,0) 钳到 0, 故保留尾部块不触发负分配或断言; attention 的
-                # causal mask 只读 num_computed..num_computed+num_new, 不脏读。
-                num_tokens = output.num_scheduled_tokens.pop(req_id)
-                output.total_num_scheduled_tokens -= num_tokens
-                self._remove_req_from_output(output, req_id)
-                request = self.active_cp_requests[req_id]
-                # [DyCP] 根因修复: 回退本拍 _update_after_schedule 乐观推进的
-                # num_computed_tokens。soft_rollback 发生在 execute_model 之前(本拍
-                # CP 段实际未执行), num_computed 的本拍推进(num_scheduled)是调度乐观值
-                # 而非真实计算。若不回退: base 下拍 num_new_tokens = num_tokens -
-                # num_computed = 0 永远 SKIP, CP 长请求(prefill)永不重排、永不 execute,
-                # 而 max_tokens=1 的 sample 恰在 prefill execute 拍完成, 故 sample 永不
-                # 做 -> CP 请求永不 finish -> active_cp 排不空 -> idle 死循环卡死; 两端
-                # 能否排出 sample 受 async 时序随机化, 致不对称 finish 撞 pop v75。
-                # 回退只减本拍 num_scheduled, 保留之前拍真实计算的进度; 物理 KV 块不
-                # 释放(已算 KV 不动, 语义不变, 不调用 kv_cache_manager.free), 与
-                # _degrade_cp_from_output 的回退逻辑对齐。
-                request.num_computed_tokens = max(
-                    0, request.num_computed_tokens - num_tokens)
+                # [DyCP] soft_rollback 的 SCHEDULED 分支与阶段2降级语义完全一致
+                # (剔除本次 output + 回退本拍虚推 num_computed + 保留已算 KV 块 /
+                # status RUNNING / running 队列), 共用公共子方法
+                # _rollback_cp_req_from_output, 消除"两套剔除代码"分叉。完整设计
+                # 语义(KV 不动 / 进度回退 / 尾部块保留 等)详见该方法 docstring。
+                self._rollback_cp_req_from_output(output, req_id)
                 logger.info(
-                    "[DYCP] Soft rollback req=%s (was SCHEDULED on this rank, "
-                    "num_computed %d->%d) -> 剔除本次 output + 回退本拍乐观推进的 "
-                    "num_computed(execute 前未真算), 保留已算物理 KV 块, status RUNNING",
+                    "[DYCP] Soft rollback req=%s (was SCHEDULED on this rank) "
+                    "-> 剔除本次 output + 回退本拍虚推 num_computed(execute 前未真算), "
+                    "保留已算物理 KV 块, status RUNNING",
                     req_id,
-                    request.num_computed_tokens + num_tokens,
-                    request.num_computed_tokens,
                 )
             else:
                 logger.info(
@@ -655,96 +661,85 @@ class CPAwareScheduler(Scheduler):
             del output.scheduled_spec_decode_tokens[req_id]
 
     # ------------------------------------------------------------------
-    # [DyCP 阶段2] 执行层 CP 对齐: 根治 async batch_queue 提交错位死锁
+    # [DyCP] CP 请求从 output 回滚的公共子方法: soft_rollback 与 阶段2降级 共用
     # ------------------------------------------------------------------
 
-    def align_execute_cp(self, scheduler_output: SchedulerOutput) -> bool:
-        """[DyCP 阶段2] 执行层 CP 对齐协商 + 必要时降级。
+    def _rollback_cp_req_from_output(
+        self, output: SchedulerOutput, req_id: str
+    ) -> None:
+        """从一个 scheduler_output 中剔除指定 CP 请求 + 回退本拍虚推的 num_computed。
 
-        根因(已 v72 取证坐实): schedule() 末尾的 CP 共识
-        (cp_sync.sync_schedule_confirm, 子组 gloo all_reduce MIN)只对齐"调度层"决策
-        (同组同是否调度某 CP 请求), 但 step_with_batch_queue 的 async batch_queue 使子组
-        两端"提交节奏"独立错位(某 DP 可早提交若干拍, v72 中 DP1 领先 DP0 两拍), 导致两端
-        在同一 execute_model 拍上 num_cp_request 不一致: 一端含长(进 mla_cp 的 dycp
-        all_gather, hccl 子组原语)、一端不含长(不进) -> hccl all_gather 不配对 -> 含长端
-        worker 同步阻塞、挂死整个 worker 进程(worker 串行执行) -> 经全 DP metadata
-        all_reduce(gloo, execute_model 内每拍发)放大成全 DP 互锁。
-
-        修复原理: 在 execute_model 提交前(step_with_batch_queue 内, schedule 之后)插入
-        一次子组 gloo all_reduce MIN(local_has_cp)。规则:
-          - 两端同含长(peer_min=1): 正常提交(CP 共识已对齐, 两端同进 all_gather);
-          - 两端同不含长(local=0): 正常提交(两端都不进 all_gather);
-          - 一端含长一端不含长(local=1 且 peer_min=0): 含长端降级(剔除本拍 CP 请求并
-            回退 num_computed_tokens), 降级后两端 num_cp_request 同 0, 都不进 all_gather。
-        此协商是子组 gloo 同步原语, 天然把两端提交节奏锁成 lockstep(子组内 submit 1:1
-        配对: 一端 negotiate #K 必须等对端 negotiate #K 才返回), 同时消除"提交错位"与
-        "num_cp 不配对"两个死锁源。
-
-        与共识层 _soft_rollback 的区别: _soft_rollback 用于"CP 共识后本 rank 未分到段"的
-        语义, 故意不回退 num_computed_tokens(已算 KV 不动, 下拍续算下一段); 本方法用于
-        "execute 前 peer 无长、本端须降级", 此时 CP 段尚未计算(super().schedule() 内的
-        _update_after_schedule 已推进 num_computed_tokens 但 worker 还没跑), 必须回退
-        num_computed_tokens, 否则下拍会跳段、KV 错位。降级只动 scheduler_output 侧计数 +
-        num_computed_tokens 回退, 不释放 KV 块、不降级 status(保持 RUNNING)、不移出
-        running(下拍续算同段), 与 _soft_rollback 的 KV/状态保留语义一致。
-
-        mooncake meta 安全性: kv_connector_metadata 由 base schedule() 在 super() 内依
-        "调度时刻"已构建; P 端 dycp>1 时 build_connector_meta 读 cp_req_id 为默认 None->[]
-        (cp_aware 在 super 之后才赋 cp_req_id), 故 meta.reqs_in_batch 恒空; 且被降级的
-        CP 正在 prefill、尚未 finish, 不在 _reqs_need_send 中, 故不在 meta.requests_to_send。
-        综上, 剔除 output 侧 CP 计数不脏读已构建的 meta, 无需重建/补丁。
-
-        非 DyCP(cp_sync is None, 即 D 端 dycp_size=1 / 非 DP)直接返回, 零影响。
-        返回 True 表示本拍发生了降级(供日志/调用方)。
+        soft_rollback(共识后本端没分到段)与阶段2降级(peer 无长本端须弃长)在
+        num_computed_tokens / KV 块 / status / running 队列的处理上语义完全一致,
+        共用本方法, 消除"一个回退一个不回退"的旧分叉。各点语义(与 commit2 一致):
+          - pop num_scheduled_tokens + 扣减 total_num_scheduled_tokens;
+            _remove_req_from_output 同步清理 scheduled_new_reqs /
+            scheduled_cached_reqs / cp_rank_scheduled_tokens / cp_req_id /
+            req_id_to_cp_size / num_cp_request / scheduled_spec_decode_tokens 等
+            output 侧计数。
+          - 回退本拍 _update_after_schedule 乐观推进的 num_computed_tokens
+            (max(0, -num_scheduled)): soft_rollback/降级都发生在 execute_model 之前,
+            本拍 CP 段实际未执行, num_computed 的本拍推进是调度乐观值而非真实计算,
+            不回退会致 base 下拍 num_new_tokens = 0 永远 SKIP -> prefill 永不重排 ->
+            永不 execute -> sample 永不做(max_tokens=1 的 sample 在 prefill execute
+            拍采) -> active_cp 排不空 -> idle 死循环卡死(v76/v77)。回退只减本拍
+            num_scheduled, 保留之前拍真实计算的进度。
+          - 不调用 kv_cache_manager.free(): 已算的物理 KV 块不释放(不回退已算 KV),
+            否则会释放该请求全部历史块、违背"已算 KV 不动"、且破坏正在向 D 传输的 KV。
+          - 不降级 status、不移出 running: 状态原样保留(保持 RUNNING), 下一拍重排续算。
+          - prev_step_scheduled_req_ids.discard: 下拍按"新续算"处理, 避免基类
+            _make_cached_request_data 的 assert not scheduled_in_prev_step。
+        本拍新分配的尾部块(尚未写入, 回滚在 execute 前发生)保留: 它们不属"已计算 KV",
+        下一拍真正执行时写入并复用。FullAttentionManager 对 running 请求的
+        get_num_blocks_to_allocate / allocate_new_blocks 在块已足够时均 max(...,0)
+        钳到 0, 故保留尾部块不触发负分配或断言; attention 的 causal mask 只读
+        num_computed..num_computed+num_new, 不脏读。
         """
-        if self.cp_sync is None:
-            return False
+        num_scheduled = output.num_scheduled_tokens.pop(req_id, 0)
+        output.total_num_scheduled_tokens -= num_scheduled
+        req = self.active_cp_requests.get(req_id)
+        if req is not None and req_id in self.requests:
+            req.num_computed_tokens = max(
+                0, req.num_computed_tokens - num_scheduled
+            )
+        self._remove_req_from_output(output, req_id)
+        self.prev_step_scheduled_req_ids.discard(req_id)
 
-        local_has_cp = 1 if (scheduler_output.num_cp_request or 0) > 0 else 0
-        flag = torch.tensor([local_has_cp], dtype=torch.int32)
-        # 子组 gloo all_reduce MIN: peer_min=1 当且仅当子组所有端本拍都含长。
-        torch.distributed.all_reduce(
-            flag, op=torch.distributed.ReduceOp.MIN,
-            group=self.cp_sync.dycp_group,
-        )
-        peer_min = int(flag.item())
-
-        if local_has_cp == 1 and peer_min == 0:
-            # 本端含长、子组内至少一端不含长 -> 降级, 剔除本拍 CP 请求并回退进度。
-            return self._degrade_cp_from_output(scheduler_output)
-        return False
+    # ------------------------------------------------------------------
+    # [DyCP 阶段2降级] 执行层 CP 对齐降级(协商已合并进 sync_schedule_confirm)
+    # ------------------------------------------------------------------
 
     def _degrade_cp_from_output(
         self, output: SchedulerOutput
     ) -> bool:
-        """[DyCP 阶段2] execute 前降级: 剔除本拍 output 全部 CP 请求并回退 prefill 进度。
+        """[DyCP 阶段2降级] 把本拍 output 中**所有** CP 请求批量 soft-rollback。
 
-        语义/根因见 align_execute_cp。与 _soft_rollback 的关键差异: 本方法回退
-        num_computed_tokens(CP 段未计算, 不回退会跳段)。KV 块 / status(保持 RUNNING) /
-        running 队列原样保留(下拍续算同段), 与 _soft_rollback 一致。
+        触发时机与 _soft_rollback 的关键区别:
+          - _soft_rollback: 共识后**逐个**处理"本端未分到段但 peer 分到了"的 CP 请求
+            (min=NOT_SCHEDULED), 是 per-req 的、针对单个请求本端没排上。
+          - _degrade_cp_from_output (本方法): 阶段2协商后**本端含长但子组不全含长**
+            (local_has_cp=1 且 subgroup_all_schedule_cp_request=0), 是**全量**: 把本端
+            本拍排上的**所有** CP 请求一次性剔出 + 回退 num_computed, 对齐子组两端
+            num_cp 同 0(D 端不进 dycp all_gather), 避免一端进 hccl all_gather、一端
+            不进致不配对 worker hang/全 DP 互锁(v72 取证)。
+
+        两者的底层执行语义**完全一致**(都是由 _rollback_cp_req_from_output 完成
+        剔除+回退 num_computed+保留 KV/status/running), 差别只在"触发条件与覆盖范围":
+          · soft_rollback: 单个 req, 触发自共识 min=NOT_SCHEDULED;
+          · _degrade_cp_from_output: 全部 CP req, 触发自协商 subgroup 不全含长。
+        故本方法循环调用公共子方法 _rollback_cp_req_from_output, 不重复实现剔除逻辑。
+
+        sky meta 安全: kv_connector_metadata 由 base schedule() 在 super() 内依
+        "调度时刻"已构建; 被降级的 CP 正在 prefill、尚未 finish, 不在 _reqs_need_send
+        中, 不在 meta.requests_to_send; cp_req_id 在 super 之后才赋, 故 meta.reqs_in_batch
+        恒空。剔除 output 侧 CP 计数不脏读已构建的 meta, 无需重建/补丁。
+        返回 True 表示本拍发生了降级(供日志/调用方)。
         """
         degraded_ids: list[str] = []
-        # 本拍 output 中的 CP 请求 = active_cp 且在本拍 num_scheduled_tokens 中。
         for req_id in list(output.num_scheduled_tokens.keys()):
             if req_id not in self.active_cp_requests:
                 continue
-            # 复用 _soft_rollback 的 output 剔除顺序: 先 pop num_scheduled_tokens +
-            # 扣 total(_remove_req_from_output 不动这两项), 再清其余 output 侧计数。
-            num_scheduled = output.num_scheduled_tokens.pop(req_id)
-            output.total_num_scheduled_tokens -= num_scheduled
-
-            req = self.active_cp_requests.get(req_id)
-            # 回退 prefill 进度: _update_after_schedule 已在 super().schedule() 内推进,
-            # 但本拍 CP 段尚未执行(execute 前), 不回退会跳段、KV 错位。
-            if req is not None and req_id in self.requests:
-                req.num_computed_tokens = max(
-                    0, req.num_computed_tokens - num_scheduled
-                )
-
-            self._remove_req_from_output(output, req_id)
-            # 下拍按"新续算"处理, 避免基类 _make_cached_request_data 的
-            # assert not scheduled_in_prev_step。
-            self.prev_step_scheduled_req_ids.discard(req_id)
+            self._rollback_cp_req_from_output(output, req_id)
             degraded_ids.append(req_id)
         return len(degraded_ids) > 0
 

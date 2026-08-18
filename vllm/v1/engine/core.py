@@ -480,42 +480,27 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        # [DyCP] 阶段1: DyCP 开启时(dycp_group 非空, 即 P 端 dycp_size>1), 每轮都进
-        # schedule 分支: 有请求则正常 schedule, 无请求则产空 SchedulerOutput(走
-        # worker DUMMY-A 发 metadata AR), 保证子组两端每轮都提交一次 execute_model、
-        # 提交节奏对齐, 从根上消除子组两端某拍一进 dycp all_gather 一不进的错位死锁。
+        # [DyCP] 阶段1+2合并: DyCP 开启时(dycp_group 非空, 即 P 端 dycp_size>1),
+        # 每轮无条件进 schedule()(即使本端无任何请求也调 super().schedule() 产空
+        # SchedulerOutput)。CP 共识(原 sync_schedule_confirm)+ 阶段2 是否含长协商
+        # (原 align_execute_cp 的 1 元 all_reduce)已合并进 schedule() 内的
+        # sync_schedule_confirm 一次 33 元 all_reduce: has_cp 固定槽 [0] = 本端是否
+        # 含长, MIN 后该槽 = subgroup_all_schedule_cp_request(子组是否都含长),
+        # 不含长对端的含长端在 schedule() 内降级对齐。故此处不再单独调
+        # align_execute_cp(已删除)、空拍不再走 make_empty(改走 schedule(), 空拍由
+        # super().schedule() 产空 output 且自带 connector_metadata)。这样子组两端
+        # 每拍都进同一次 33 元共识 all_reduce, 同形状配对, 根治"空拍端不调共识、
+        # 忙端调"的 hang 与"32元共识 vs 1元 align"错配抢同一 dycp_group 的
+        # gloo Connection reset 崩(v81)。
         # 非 DyCP(D 端 dycp_size=1 / 非 DP 单引擎) dycp_group 为 None -> 维持原
         # has_requests 门控, 不影响原有特性(条件分支隔离)。
         dycp_enabled = getattr(self, "dycp_group", None) is not None
         if self.scheduler.has_requests() or dycp_enabled:
-            scheduler_output = (
-                self.scheduler.schedule()
-                if self.scheduler.has_requests()
-                else SchedulerOutput.make_empty()
-            )
-            # [DyCP] 阶段1修: 空 output(make_empty)不经 schedule, 缺
-            # kv_connector_metadata(默认 None)。worker 在 0-token + kv 连接器
-            # 路径(kv_connector_no_forward -> _get_kv_connector_output)
-            # 会 assert kv_connector_metadata is not None, 否则 idle rank 崩(v73 DP2)。
-            # 故空 output 须补 build_connector_meta, 使其与 schedule 出的 0-token
-            # output(CP 空转拍, schedule 尾部填 connector_metadata)语义一致。
-            if (not self.scheduler.has_requests()
-                    and getattr(self.scheduler, "connector", None) is not None):
-                scheduler_output.kv_connector_metadata = (
-                    self.scheduler._build_kv_connector_meta(
-                        self.scheduler.connector, scheduler_output
-                    )
-                )
-            # [DyCP 阶段2] 执行层 CP 对齐协商: 保证子组两端每拍 execute 的
-            # num_cp_request 一致(同 0 或同 >0), 根治 async batch_queue 提交错位致
-            # dycp all_gather(hccl 子组)不配对的死锁。根因/修复原理详见
-            # CPAwareScheduler.align_execute_cp。仅在 DyCP 开启(dycp_group 非空)时调用;
-            # 协商(子组 gloo all_reduce MIN)+ 降级(回退 num_computed_tokens)全在
-            # scheduler 侧完成, 此处仅条件分支调用。非 DyCP 不进, 零影响(条件分支隔离)。
-            # real schedule 与 make_empty 空拍都会调到, 保证子组两端每拍都参与协商
-            # (gloo 阻塞同步, 天然把子组 submit 锁成 lockstep 配对)。
-            if dycp_enabled and hasattr(self.scheduler, "align_execute_cp"):
-                self.scheduler.align_execute_cp(scheduler_output)
+            # DyCP 模式无条件 schedule(空拍也走 super().schedule(), 共识在 schedule()
+            # 内完成); 非 DyCP 仅 has_requests 时 schedule。super().schedule() 零请求
+            # 也会产空 SchedulerOutput 并在尾部构建 kv_connector_metadata(若 connector
+            # 非空), 故 DyCP 空拍无需再补 build_connector_meta。
+            scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
