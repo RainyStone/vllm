@@ -22,7 +22,7 @@ import torch.distributed
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -287,6 +287,18 @@ class CPAwareScheduler(Scheduler):
             and vllm_config.kv_transfer_config.is_kv_producer
         )
 
+        # [DyCP v82 保序修复] 首次调度被回滚(soft_rollback/degrade)的 CP 请求: 已进
+        # running、但 worker 从未收到它的 new_req 注册(degrade/soft_rollback 把它从
+        # 当拍 output 剔除了)。若按现行"留 running 续算"处理, 下拍 base 会以
+        # scheduled_cached_reqs 下发, worker self.requests[req_id] 查无 -> KeyError
+        # (gpu_model_runner._update_states, v82 根因)。
+        # 修复: 这类请求留 running 原位(不回 waiting, 保序)并记入本集合; 下拍它被
+        # base 当 cached 续算 schedule 时, 若子组已对齐(未被本拍再次回滚), 由
+        # _emit_pending_new_cp_as_new 把它从 scheduled_cached_reqs 挪到
+        # scheduled_new_reqs 发出 -> worker 走 new 注册路径, 不再 KeyError, 且
+        # running 位置不动 -> 无持续失序。
+        self._cp_reqs_pending_new_emit: set[str] = set()
+
     # ------------------------------------------------------------------
     # Request classification and routing
     # ------------------------------------------------------------------
@@ -486,6 +498,8 @@ class CPAwareScheduler(Scheduler):
         for req_id in finished_ids:
             req = self.active_cp_requests.pop(req_id, None)
             self.prev_step_scheduled_req_ids.discard(req_id)
+            # [DyCP v82] 同步清 pending(首调回滚未发出的 CP 请求若被 finish)
+            self._cp_reqs_pending_new_emit.discard(req_id)
             if req is not None:
                 logger.info(
                     "[DYCP] CP request %s removed from active_cp_requests"
@@ -519,6 +533,12 @@ class CPAwareScheduler(Scheduler):
 
 
         logger.info(f"[DYCP] Test: 44444444: CPAwareScheduler调度结束.....")
+
+        # [DyCP v82 保序修复] 首次调度被回滚的 CP 请求留 running 原位并标 pending,
+        # 本拍若又被 base 当 cached 续算 schedule 且子组已对齐(未被本拍再次回滚),
+        # 从 scheduled_cached_reqs 挪到 scheduled_new_reqs 发出(worker 注册),
+        # 避免 KeyError, 且 running 位置不动 -> 保序。
+        self._emit_pending_new_cp_as_new(output)
 
         return output
     
@@ -588,6 +608,9 @@ class CPAwareScheduler(Scheduler):
     ) -> SchedulerOutput:
         """Full rollback: all ranks preempt, reset num_computed_tokens=0."""
         for req_id in rollback_ids:
+            # [DyCP v82] hard_rollback 已把 req 放回 waiting(下拍走 waiting->new
+            # 正常路径), 不必再 pending。
+            self._cp_reqs_pending_new_emit.discard(req_id)
             # Same as _soft_rollback: skip and clean up if already finished.
             if req_id not in self.requests:
                 self.active_cp_requests.pop(req_id, None)
@@ -628,6 +651,27 @@ class CPAwareScheduler(Scheduler):
 
         return output
     
+    def _remove_req_from_cached_only(
+        self, output: SchedulerOutput, req_id: str
+    ) -> None:
+        """仅从 scheduled_cached_reqs 移除一个 req(平行列表 + all_token_ids +
+        resumed_req_ids), 不动 num_scheduled_tokens/total/CP 元数据/
+        scheduled_new_reqs。供 cached->new 挪动使用(区别于 _remove_req_from_output
+        会连 CP 元数据一起清)。"""
+        cached = output.scheduled_cached_reqs
+        if req_id not in cached.req_ids:
+            return
+        idx = cached.req_ids.index(req_id)
+        cached.req_ids.pop(idx)
+        if cached.new_token_ids:
+            cached.new_token_ids.pop(idx)
+        cached.new_block_ids.pop(idx)
+        cached.num_computed_tokens.pop(idx)
+        cached.num_output_tokens.pop(idx)
+        cached.resumed_req_ids.discard(req_id)
+        if req_id in cached.all_token_ids:
+            del cached.all_token_ids[req_id]
+
     def _remove_req_from_output(
         self, output: SchedulerOutput, req_id: str
     ) -> None:
@@ -635,19 +679,7 @@ class CPAwareScheduler(Scheduler):
         output.scheduled_new_reqs = [
             r for r in output.scheduled_new_reqs if r.req_id != req_id
         ]
-
-        cached = output.scheduled_cached_reqs
-        if req_id in cached.req_ids:
-            idx = cached.req_ids.index(req_id)
-            cached.req_ids.pop(idx)
-            if cached.new_token_ids:
-                cached.new_token_ids.pop(idx)
-            cached.new_block_ids.pop(idx)
-            cached.num_computed_tokens.pop(idx)
-            cached.num_output_tokens.pop(idx)
-            cached.resumed_req_ids.discard(req_id)
-            if req_id in cached.all_token_ids:
-                del cached.all_token_ids[req_id]
+        self._remove_req_from_cached_only(output, req_id)
 
         if output.cp_rank_scheduled_tokens and req_id in output.cp_rank_scheduled_tokens:
             del output.cp_rank_scheduled_tokens[req_id]
@@ -695,6 +727,11 @@ class CPAwareScheduler(Scheduler):
         钳到 0, 故保留尾部块不触发负分配或断言; attention 的 causal mask 只读
         num_computed..num_computed+num_new, 不脏读。
         """
+        # [DyCP v82] 在 _remove_req_from_output 清 scheduled_new_reqs 之前, 判定
+        # 本 req 这拍是否首次调度(在 scheduled_new_reqs 中, 即 worker 尚未注册)。
+        was_first_schedule = any(
+            r.req_id == req_id for r in output.scheduled_new_reqs
+        )
         num_scheduled = output.num_scheduled_tokens.pop(req_id, 0)
         output.total_num_scheduled_tokens -= num_scheduled
         req = self.active_cp_requests.get(req_id)
@@ -704,6 +741,14 @@ class CPAwareScheduler(Scheduler):
             )
         self._remove_req_from_output(output, req_id)
         self.prev_step_scheduled_req_ids.discard(req_id)
+        # [DyCP v82] 首次调度即回滚: worker 从未收到该 req 的 new_req 注册。若按现
+        # 行"留 running 续算"处理, 下拍 base 会以 scheduled_cached_reqs 下发 ->
+        # worker self.requests[req_id] KeyError(v82 根因)。留 running 原位(保序)并
+        # 标 pending, 由 schedule() 末尾 _emit_pending_new_cp_as_new 在下拍子组对齐
+        # 时挪到 scheduled_new_reqs 发出(worker 注册)。续算回滚(was_first_schedule=
+        # False, worker 已有)不标, 仍走 cached 续算(现行行为不变)。
+        if was_first_schedule and req_id in self.requests:
+            self._cp_reqs_pending_new_emit.add(req_id)
 
     # ------------------------------------------------------------------
     # [DyCP 阶段2降级] 执行层 CP 对齐降级(协商已合并进 sync_schedule_confirm)
@@ -742,6 +787,55 @@ class CPAwareScheduler(Scheduler):
             self._rollback_cp_req_from_output(output, req_id)
             degraded_ids.append(req_id)
         return len(degraded_ids) > 0
+
+    # ------------------------------------------------------------------
+    # [DyCP v82 保序修复] 首次调度被回滚的 CP 请求: 下拍子组对齐时以 new 发出
+    # ------------------------------------------------------------------
+
+    def _emit_pending_new_cp_as_new(self, output: SchedulerOutput) -> None:
+        """[DyCP v82 保序] 把本拍 scheduled_cached_reqs 里属于
+        ``_cp_reqs_pending_new_emit`` 的 CP 请求挪到 scheduled_new_reqs 发出。
+
+        背景: 首次调度被回滚的 CP 请求留 running 原位并标 pending(见
+        _rollback_cp_req_from_output)。本拍 base 把它当 running 续算放进
+        scheduled_cached_reqs; 若子组已对齐(未被本拍再次回滚, 仍在 cached 中),
+        则把它从 cached 挪到 new: worker 走 new 注册路径
+        (self.requests[req_id]=CachedRequestState) 而非 cached 查找路径
+        (req_state=self.requests[req_id]->KeyError, v82 根因)。
+        挪动只动 scheduled_cached_reqs/scheduled_new_reqs, 不动
+        num_scheduled_tokens/total/CP 元数据(new/cached 不影响这些; scheduler 侧
+        update_from_output 按 num_scheduled_tokens 统一处理, 不区分 new/cached)。
+        挪动后清 pending。续算回滚的请求(worker 已有)不进 pending, 仍走 cached 续算。
+        NewRequestData 构造与 base scheduler.py:830-847 同款(v2 model runner 带
+        prefill_token_ids)。
+        """
+        if not self._cp_reqs_pending_new_emit:
+            return
+        cached = output.scheduled_cached_reqs
+        # 本拍仍在 cached(被 schedule 且未被本拍回滚)的 pending req
+        move_ids = [
+            r for r in cached.req_ids if r in self._cp_reqs_pending_new_emit
+        ]
+        if not move_ids:
+            return
+        for req_id in move_ids:
+            req = self.requests.get(req_id)
+            if req is None or req_id not in self.requests:
+                # 请求已不在(被 finish/hard_rollback 等清掉), 清 pending
+                self._cp_reqs_pending_new_emit.discard(req_id)
+                continue
+            block_ids = self.kv_cache_manager.get_blocks(req_id).get_block_ids()
+            # 从 CachedRequestData 外科式移除(不动 num_scheduled_tokens/total/CP 元数据)
+            self._remove_req_from_cached_only(output, req_id)
+            # 以 new 发出: worker 注册 + prefill(此时子组已对齐, dycp all_gather 配对)
+            if getattr(self, "use_v2_model_runner", False):
+                new_req_data = NewRequestData.from_request(
+                    req, block_ids, prefill_token_ids=req._all_token_ids
+                )
+            else:
+                new_req_data = NewRequestData.from_request(req, block_ids)
+            output.scheduled_new_reqs.append(new_req_data)
+            self._cp_reqs_pending_new_emit.discard(req_id)
 
     # ------------------------------------------------------------------
     # Update from output: handle CP request completion
