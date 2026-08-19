@@ -834,6 +834,25 @@ class CPAwareScheduler(Scheduler):
                 )
             else:
                 new_req_data = NewRequestData.from_request(req, block_ids)
+            # [DyCP v85 修复] emit-as-NEW 必须用 "advance 前" 的 num_computed_tokens。
+            # 本方法在 schedule() 末尾调用, 此时 base 的 _update_after_schedule 已把
+            # req.num_computed_tokens += num_scheduled_tokens 这拍虚推。正常首调 NEW 在
+            # _update_after_schedule 之前构造 NewRequestData, 故其带的 num_computed_tokens
+            # 是 advance 前(首次=0); 而 emit 在 advance 之后构造, NewRequestData.from_request
+            # 会沿用 advance 后的值(如 9)。worker NEW 路径按 num_new = prompt_len -
+            # num_computed_tokens 取 token: 带 9 时算出 0 个新 token(全 -1 slot 不写 KV),
+            # 而 peer 这拍走 cached-cont 写真实 slot, 两端同一 CP 请求同拍 num_new 不对称
+            # -> per-layer dycp all_gather / KV 写入发散 -> 层间集合通信错位死锁(v85)。
+            # 这里把虚推 advance 撤回, 取 advance 前值, 使 emit-as-NEW 与正常 fresh-NEW
+            # 语义一致。was_first_schedule 的 pending 请求 worker 从未注册、无真实 KV,
+            # advance 前值即 fresh 起拍点(正常无 prefix 命中时为 0), 撤回安全。req 侧同步
+            # 回退, 待 worker 执行后 update_from_output 重新推进到正确进度。
+            num_scheduled_tokens_this_step = output.num_scheduled_tokens.get(req_id, 0)
+            num_computed_tokens_before_advance = max(
+                0, req.num_computed_tokens - num_scheduled_tokens_this_step
+            )
+            new_req_data.num_computed_tokens = num_computed_tokens_before_advance
+            req.num_computed_tokens = num_computed_tokens_before_advance
             output.scheduled_new_reqs.append(new_req_data)
             self._cp_reqs_pending_new_emit.discard(req_id)
 
