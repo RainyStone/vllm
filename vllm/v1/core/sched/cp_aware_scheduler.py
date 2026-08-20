@@ -4,13 +4,15 @@
 
 Extends the existing Scheduler with CP awareness while preserving the
 per-DP independent process architecture. CP requests are coordinated
-via a post-schedule all-reduce MIN consensus protocol.
+via a post-schedule all_gather_object consensus protocol that aligns
+per-request scheduling states by request_id (not by fixed slot position).
 
-Design rationale: the client layer (DPEngineCoreClient) broadcasts CP requests
-to ALL DP ranks before they reach the scheduler, so every rank is guaranteed to
-hold the same CP request. No pre-schedule announce/vote phase is needed.
-Coordination is a single post-schedule all-reduce MIN that agrees on whether
-each rank successfully scheduled each CP request in the current step.
+Design rationale: CP requests are routed to the DyCP subgroup that owns them,
+so only the cooperating ranks need to agree, and no pre-schedule announce/vote
+phase is needed. Coordination is a single post-schedule all_gather_object that
+exchanges each rank's {req_id: status} dict; per-request decisions are merged
+by req_id MIN, agreeing on whether each rank successfully scheduled each CP
+request in the current step.
 """
 from __future__ import annotations
 
@@ -35,9 +37,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Maximum number of CP requests that can be synced in one round.
-_MAX_CP_SYNC_SLOTS = 32 # TODO [DyCP] 不能动态设置槽位吗？固定数量槽位的，共识时只有前_MAX_CP_SYNC_SLOTS个长请求可以被共识，如果某个rank上超过这个槽位上限位置的请求被调度到，这个请求就不会在所有rank上进行共识，会出错吗？
-
 # Three-state encoding for post-schedule consensus.
 SCHEDULED = 2
 NOT_SCHEDULED = 1
@@ -47,16 +46,18 @@ PREEMPTED = 0
 class CPSyncProtocol:
     """Post-schedule consensus protocol for CP request scheduling.
 
-    Uses the DyCP subgroup (``dycp_group``) all-reduce MIN to agree on whether
-    each active CP request was successfully scheduled on ALL ranks of its CP
-    group in the current step.
+    Uses the DyCP subgroup (``dycp_group``) gloo all_gather_object to
+    exchange each rank's {req_id: status} dict, then merges per-request states
+    by req_id MIN to agree on whether each active CP request was successfully
+    scheduled on ALL ranks of its CP group in the current step.
 
     Three-state encoding per request:
         SCHEDULED (2)     - this rank scheduled the request
         NOT_SCHEDULED (1) - this rank did not schedule it (budget exhausted)
         PREEMPTED (0)     - this rank preempted it (KV cache eviction)
 
-    After all-reduce MIN:
+    After per-req_id MIN merge:
+
         min >= SCHEDULED  -> confirmed: execute on all ranks
         min >= NOT_SCHEDULED -> soft rollback: re-queue without resetting KV
         min == PREEMPTED  -> hard rollback: all ranks evict and reset
@@ -73,87 +74,104 @@ class CPSyncProtocol:
         # cooperatively decode a given CP request need to agree on its
         # schedule/rollback decision. Using the full DP group here was a
         # leftover bug that forced CP requests to be broadcast to every DP
-        # rank (to keep all_reduce slots aligned) and produced duplicate
-        # outputs.
+        # rank and produced duplicate outputs.
         self.dycp_group = dycp_group
-        self.cp_world_size = cp_world_size   # TODO [DyCP] self.cp_world_size 参数未用到，删除？
+        self.cp_world_size = cp_world_size
         self.cp_rank = cp_rank
-
-        # Pre-allocated tensor for post-schedule all-reduce (avoids per-call
-        # allocation on the hot path).
-        # [DyCP] 共识张量布局(33 元):
-        #   索引 [0]           : has_cp 固定标志槽。恒存在、不随 num_slots 截断。
-        #                        填 1 表示本拍本 rank 调度到了 CP 长请求, 填 0 表示没有。
-        #                        all_reduce MIN 后, 该槽的 min = subgroup_all_schedule_cp_request
-        #                        (=1 当且仅当子组所有端本拍都排了 CP 长请求; =0 表示至少一端没排)。
-        #                        用于驱动阶段2降级: 本端有长但子组不全有长 -> 降级对齐两端 num_cp。
-        #   索引 [1 .. _MAX_CP_SYNC_SLOTS]: CP 请求状态槽(SCHEDULED/NOT_SCHEDULED/PREEMPTED), 语义不变。
-        # has_cp 固定放第 0 槽、不截断, 保证空拍(无 active_cp)两端仍同形状(all_reduce 全 33 元),
-        # 根治(共识仅忙拍调、空拍不调)导致的 32元↔1元 错配崩溃(v81)与忙端 hang。
-        self._confirm_tensor = torch.zeros(
-            _MAX_CP_SYNC_SLOTS + 1, dtype=torch.int32, device="cpu"
-        )
 
     def sync_schedule_confirm(
         self,
         active_ids: list[str],
         status: list[int],
-        local_has_cp: int,
+        local_scheduled_cp: int,
     ) -> tuple[list[str], list[str], list[str], int]:
-        """Post-schedule consensus using three-state encoding, 合并阶段2协商.
+        """Post-schedule consensus using all_gather_object by req_id, 合并阶段2协商.
 
-        把"CP 请求状态共识"(原 32 槽)与"阶段2 是否含长协商"(原 align_execute_cp
-        的 1 元 all_reduce)合并成本方法内的**一次** all_reduce, 根治两者抢同一
-        dycp_group、形状 32≠1 错配崩溃(v81)及"共识仅忙拍调、空拍不调"的忙端 hang.
+        用子组内一次 gloo all_gather_object 交换 {req_id: status} 字典, 按 req_id
+        精确合并, 取代原固定槽位 tensor + all_reduce MIN。
+
+        根因(本方法替代的旧机制缺陷): 旧机制用固定槽位 tensor + all_reduce MIN,
+        对齐完全依赖各 rank sorted(active_ids) 同 position = 同 req_id。但
+        add_request_async 子组内串行 await send 造成 owner 与非 owner 收到 add 的
+        到达窗口; 窗口内两端 active 集合不一致 -> sorted 后同 position 不是同一
+        req_id -> 共识把不同 req 的状态投到同一槽 MIN -> position 错位(不打注入也
+        偶发 v78/v82 类)。本方法按 req_id 合并, 不依赖 position, 从根消除错位;
+        并集无截断、不要求各端同 N、不要求同 key 集合。
 
         Args:
-            active_ids: Active CP request IDs (sorted, identical across ranks).
+            active_ids: Active CP request IDs (sorted)。object 版仅作本端遍历用,
+                        合并以 all_gather 后的并集为准, 不再要求跨 rank identical。
             status: Per-request status on this rank
-                    (SCHEDULED=2 / NOT_SCHEDULED=1 / PREEMPTED=0)。
-            local_has_cp: 本拍本 rank 是否调度到 CP 长请求(1=是, 0=否)。
-                          写入固定槽 [0], all_reduce MIN 后该槽即阶段2协商结果。
+                    (SCHEDULED=2 / NOT_SCHEDULED=1 / PREEMPTED=0), 与 active_ids 对齐。
+            local_scheduled_cp: 本拍本 rank 是否"调度到" CP 长请求(1=是, 0=否)。
+                                注意是"本步是否调度到", 非"是否持有"——active 有但本步
+                                未调度到=0。写入保留键 __scheduled_cp__, all_gather 后
+                                取全子组 MIN 即 subgroup_all_schedule_cp_request。
 
         Returns:
             (confirmed_ids, soft_rollback_ids, hard_rollback_ids,
-             subgroup_all_schedule_cp_request)
-            其中 subgroup_all_schedule_cp_request = 子组所有端 local_has_cp 的 MIN:
-              =1 当且仅当子组所有端本拍都排了 CP 长请求(两端都含长);
-              =0 表示至少一端本拍没排 CP 长请求(含长端须降级对齐)。
+             subgroup_all_schedule_cp_request) —— 返回合约与旧机制完全一致, 下游
+             (_degrade_cp_from_output / _soft_rollback / _hard_rollback / dummy 门控)
+             零改动。其中 subgroup_all_schedule_cp_request = 子组所有端
+             local_scheduled_cp 的 MIN: =1 当且仅当子组所有端本拍都调度到 CP 长请求;
+             =0 表示至少一端本拍没调度到(含长端须降级对齐)。
+
+        缺 key 语义: 某 req 不在本端发来的 dict 中(未收到 add / 已 finish 清出),
+        合并时一律按 NOT_SCHEDULED 取("本端没排到它"), 不误判成 PREEMPTED(仅显式投
+        PREEMPTED 才算 hard_rollback 危险值)。故 add 异步到达时一端 SCHEDULED / 另一端
+        没到 -> MIN=NOT_SCHEDULED -> soft_rollback, 与"peer 没排到它"语义一致。
         """
-        num_slots = min(len(active_ids), _MAX_CP_SYNC_SLOTS) # TODO [DyCP] 不同rank上，active_ids是一致的吗？不一致是否会有影响
+        # 构造本端要发出的 dict: __scheduled_cp__ 是保留键(代替旧槽位机制的标志槽),
+        # 表示本 rank 本步是否调度到长请求(1/0); 其余 key=req_id, value=该 req 本端状态。
+        local_status_dict: dict = {"__scheduled_cp__": local_scheduled_cp}
+        for i, req_id in enumerate(active_ids):
+            local_status_dict[req_id] = status[i]
 
-        # [DyCP] 根因修复(v77/v78): CP 槽([1..32])初始填充 NOT_SCHEDULED(1) 而非
-        # PREEMPTED(0)。短端 active_ids 较少时尾部超出槽位保持初始值, 若为 0 则
-        # all_reduce MIN 会把长端同位置真 req 的 min 拉到 0 -> 误判 hard_rollback ->
-        # 释放正在用/正在传 D 的 KV 块 -> Worker KeyError(v77)/ 卡死(v78)。
-        # has_cp 固定槽 [0] 单独写 local_has_cp(不随 num_slots 截断)。
-        self._confirm_tensor.fill_(NOT_SCHEDULED)
-        self._confirm_tensor[0] = local_has_cp
-        for i in range(num_slots):
-            self._confirm_tensor[i + 1] = status[i]
-
-        # ★ 关键改: 空拍(num_slots==0)不再提前 return —— 仍走 all_reduce 全 33 元。
-        # 否则忙端共识(33元)等不到空端 -> hang; 且原 align 的 1 元与共识 32 元错配 -> 崩。
-        torch.distributed.all_reduce(
-            self._confirm_tensor,
-            op=torch.distributed.ReduceOp.MIN,
-            group=self.dycp_group,
+        # 子组内一次 gloo all_gather_object。返回 gathered_objects[src_cp_rank] =
+        # 子组内 cp_rank=src 的端发来的 dict, 长度恒=子组端数(dycp_size, 可 >2);
+        # 各段天然按 cp_rank 区分来源。空拍端 dict={"__scheduled_cp__":0} 仍参与
+        # gather(旧机制空拍不进共识致忙端 hang 的根因已由此根治), 形状不对齐安全。
+        gathered_objects: list[dict] = [
+            {} for _ in range(self.cp_world_size)
+        ]
+        torch.distributed.all_gather_object(
+            gathered_objects, local_status_dict, group=self.dycp_group,
         )
 
-        subgroup_all_schedule_cp_request = int(self._confirm_tensor[0].item())
+        # 子组所有端 scheduled_cp 的 MIN -> subgroup_all_schedule_cp_request。
+        # 普通循环取 min, 不用生成器表达式。
+        subgroup_all_schedule_cp_request = SCHEDULED  # 初始为最大值, 下面循环取 min
+        for src_rank in range(self.cp_world_size):
+            value = int(gathered_objects[src_rank].get("__scheduled_cp__", 0))
+            if value < subgroup_all_schedule_cp_request:
+                subgroup_all_schedule_cp_request = value
 
+        # 收集所有 req_id 并集(sorted 稳定, 仅影响日志/列表顺序, 不影响语义与下游)。
+        # 普通循环构造 set 再 sorted, 不用集合推导式。
+        req_ids_union_set = set()
+        for src_rank in range(self.cp_world_size):
+            for key in gathered_objects[src_rank].keys():
+                if key != "__scheduled_cp__":
+                    req_ids_union_set.add(key)
+        all_req_ids = sorted(req_ids_union_set)
+
+        # 按 req_id 精确合并: 各端 status 取 MIN(缺 key -> NOT_SCHEDULED), 三态分类。
+        # 普通循环取 min, 不用生成器表达式; 不引入探针变量。
         confirmed: list[str] = []
         soft_rollback: list[str] = []
         hard_rollback: list[str] = []
-        if num_slots > 0:
-            for i in range(num_slots):
-                val = self._confirm_tensor[i + 1].item()
-                if val >= SCHEDULED:
-                    confirmed.append(active_ids[i])
-                elif val >= NOT_SCHEDULED:
-                    soft_rollback.append(active_ids[i])
-                else:
-                    hard_rollback.append(active_ids[i])
+        for req_id in all_req_ids:
+            min_status = SCHEDULED  # 初始最大值, 下面循环取 min
+            for src_rank in range(self.cp_world_size):
+                value = int(gathered_objects[src_rank].get(req_id, NOT_SCHEDULED))
+                if value < min_status:
+                    min_status = value
+            if min_status >= SCHEDULED:
+                confirmed.append(req_id)
+            elif min_status >= NOT_SCHEDULED:
+                soft_rollback.append(req_id)
+            else:
+                hard_rollback.append(req_id)
 
         if soft_rollback or hard_rollback:
             logger.info(
@@ -167,25 +185,6 @@ class CPSyncProtocol:
 
         return confirmed, soft_rollback, hard_rollback, subgroup_all_schedule_cp_request
     
-    def sync_empty(self) -> None:
-        """Participate in the sync all_reduce with no active CP requests.
-
-        Called by ranks that have no active CP requests in a given step so
-        that peer ranks which do have active requests are not blocked waiting
-        for all participants in the collective operation.
-
-        Fills the tensor with NOT_SCHEDULED (1) so that the MIN operation does
-        not drive any active slot down to PREEMPTED (0), which would trigger
-        spurious hard-rollbacks on the peer ranks.
-        """
-        self._confirm_tensor.fill_(NOT_SCHEDULED)
-        torch.distributed.all_reduce(
-            self._confirm_tensor,
-            op=torch.distributed.ReduceOp.MIN,
-            group=self.dycp_group,
-        )
-
-
 class CPAwareScheduler(Scheduler):
     """Scheduler with CP awareness for distributed DYCP.
 
@@ -200,7 +199,7 @@ class CPAwareScheduler(Scheduler):
       CP request to the dycp_group that owns it, so no announce phase needed)
     - Only allocates local portion of KV cache for CP requests
     - Adds CP metadata to SchedulerOutput
-    - Post-schedule all-reduce MIN agrees on confirmed/rollback decisions
+    - Post-schedule all_gather_object (by req_id) agrees on confirmed/rollback decisions
     """
 
     def __init__(
@@ -374,8 +373,8 @@ class CPAwareScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def has_requests(self) -> bool:
-        # Active CP requests require this rank to participate in the all_reduce
-        # even when it has no locally-scheduled tokens, so treat them as
+        # Active CP requests require this rank to participate in the all_gather_object
+        # consensus even when it has no locally-scheduled tokens, so treat them as
         # "requests to handle" from core.py's perspective.
         return super().has_requests() or bool(self.active_cp_requests)
     
@@ -389,7 +388,7 @@ class CPAwareScheduler(Scheduler):
         When cp_sync is active this method performs:
           1. super().schedule() — local scheduling as usual
           2. Annotate output with CP metadata
-          3. all_reduce MIN — agree on confirmed / rollback decisions
+          3. all_gather_object by req_id — agree on confirmed / rollback decisions
           4. Apply rollbacks and finalise cp_req_ids_sorted
         """
         self._preempted_this_step.clear()
@@ -433,11 +432,11 @@ class CPAwareScheduler(Scheduler):
             self.cp_rank, self.cp_world_size, output.num_cp_request, num_dp_req,
         )
 
-        # 本拍本 rank 是否调度到 CP 长请求(1=是, 0=否)。
-        # 用于合并共识 sync_schedule_confirm 的 has_cp 固定槽 [0]: all_reduce MIN 后
-        # 该槽 = subgroup_all_schedule_cp_request(子组是否所有端本拍都含长),
-        # 驱动下方阶段2降级。须在 CP 元数据标注(num_cp_request 已赋)之后计算。
-        local_has_cp = 1 if output.num_cp_request > 0 else 0
+        # 本拍本 rank 是否"调度到" CP 长请求(1=是, 0=否; 非"是否持有")。
+        # 用于合并共识 sync_schedule_confirm 的保留键 __scheduled_cp__: all_gather
+        # 后子组所有端该值的 MIN = subgroup_all_schedule_cp_request(子组是否所有端
+        # 本拍都调度到长), 驱动下方阶段2降级。须在 CP 元数据标注(num_cp_request 已赋)后计算。
+        local_scheduled_cp = 1 if output.num_cp_request > 0 else 0
 
         # No sync needed (single DP or test environment without dp_group).
         if self.cp_sync is None:
@@ -445,13 +444,13 @@ class CPAwareScheduler(Scheduler):
             return output
 
         # [DyCP] 合并修复(v81 根因): 不再因"本端无 active_cp"就提前 return。
-        # 空拍也必须进 sync_schedule_confirm 的 33 元 all_reduce: 否则忙端
-        # (有 active_cp)的共识会一直等空端 -> hang; 且原"空拍跳过共识、忙端调
-        # 共识(32元)"配合 align_execute_cp 的独立 1 元 all_reduce, 形状 32!=1
-        # 错配抢同一 dycp_group -> gloo Connection reset 崩(v81)。现两者合并成
-        # schedule() 内一次 33 元 all_reduce, 空拍端 has_cp=0 + CP 槽全
-        # NOT_SCHEDULED, 与忙端同形状配对, 根治 hang 与崩。
-        # Build per-request status vector for the all_reduce.
+        # 空拍也必须进 sync_schedule_confirm 的 all_gather_object: 否则忙端
+        # (有 active_cp)的共识会一直等空端 -> hang。原 tensor 固定槽位机制下曾
+        # 因"空拍跳过共识、忙端调共识"配合 align 的独立 all_reduce 形状错配抢
+        # 同一 dycp_group 致 gloo Connection reset 崩(v81)。现 object 版合并成
+        # 一次 all_gather_object, 空拍端 dict={"__scheduled_cp__":0} 仍参与
+        # gather, 与忙端同调用配对(不要求 key 集合一致), 根治 hang 与崩。
+        # Build per-request status vector for the all_gather_object.
         active_ids = sorted(self.active_cp_requests.keys())
         status: list[int] = []
         finished_ids: list[str] = []
@@ -491,7 +490,7 @@ class CPAwareScheduler(Scheduler):
             status.append(s)
 
         confirmed, soft_rollback_ids, hard_rollback_ids, subgroup_all_schedule_cp_request = (
-            self.cp_sync.sync_schedule_confirm(active_ids, status, local_has_cp)
+            self.cp_sync.sync_schedule_confirm(active_ids, status, local_scheduled_cp)
         )
 
         # Clean up requests that finished on this rank before the sync.
@@ -507,15 +506,15 @@ class CPAwareScheduler(Scheduler):
                     req_id, self.cp_rank,
                 )
 
-        # [DyCP 阶段2] 协商降级: 本端含长(local_has_cp=1)但子组不全含长
+        # [DyCP 阶段2] 协商降级: 本端含长(local_scheduled_cp=1)但子组不全含长
         # (subgroup_all_schedule_cp_request=0) -> 全量剔除本拍 CP 请求并回退
         # num_computed(降级), 对齐子组两端 num_cp 同 0(都不进 dycp all_gather)。
         # 降级插在 soft/hard_rollback 之前且互斥安全: 降级场景下至少一端空拍
-        # (其 has_cp=0、CP 槽全 NOT_SCHEDULED), 该端不会投 PREEMPTED, 故
+        # (其 scheduled_cp=0、dict 不含该 CP req, 合并取 NOT_SCHEDULED), 该端不会投 PREEMPTED, 故
         # hard_rollback_ids 为空; soft_rollback_ids 含本端全部 cp, 但已被降级从
         # output 剔除(num_scheduled_tokens 已 pop), _soft_rollback 的 SCHEDULED
         # 分支判 not in num_scheduled_tokens 走 else 无害空转, 不重复回退。
-        if local_has_cp == 1 and subgroup_all_schedule_cp_request == 0:
+        if local_scheduled_cp == 1 and subgroup_all_schedule_cp_request == 0:
             self._degrade_cp_from_output(output)
         if soft_rollback_ids:
             output = self._soft_rollback(output, soft_rollback_ids)
@@ -763,7 +762,7 @@ class CPAwareScheduler(Scheduler):
           - _soft_rollback: 共识后**逐个**处理"本端未分到段但 peer 分到了"的 CP 请求
             (min=NOT_SCHEDULED), 是 per-req 的、针对单个请求本端没排上。
           - _degrade_cp_from_output (本方法): 阶段2协商后**本端含长但子组不全含长**
-            (local_has_cp=1 且 subgroup_all_schedule_cp_request=0), 是**全量**: 把本端
+            (local_scheduled_cp=1 且 subgroup_all_schedule_cp_request=0), 是**全量**: 把本端
             本拍排上的**所有** CP 请求一次性剔出 + 回退 num_computed, 对齐子组两端
             num_cp 同 0(D 端不进 dycp all_gather), 避免一端进 hccl all_gather、一端
             不进致不配对 worker hang/全 DP 互锁(v72 取证)。
@@ -880,8 +879,10 @@ class CPAwareScheduler(Scheduler):
         # Do NOT clean up active_cp_requests here. Removal is handled in
         # schedule() once we detect req_id not in self.requests.
         # Removing here would make active_ids diverge between ranks on the
-        # next step (one rank finishes a step earlier), causing slot mismatches
-        # in the all-reduce and breaking the sync protocol.
+        # next step (one rank finishes a step earlier), causing req_id-set
+        # divergence between ranks; per-req_id merge tolerates this (missing key
+        # = NOT_SCHEDULED) but finishing here would still let the request linger
+        # on the slower rank via spurious rollback, so cleanup stays in schedule().
 
         # [DyCP] A CP (long) request is decoded cooperatively by the `dycp_size`
         # ranks of its CP group. The worker aligns the sampled tokens inside
