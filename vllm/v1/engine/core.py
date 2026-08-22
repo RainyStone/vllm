@@ -1748,18 +1748,8 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             # Consensus is gloo (host-side); EngineCore has no device here.
             self.dycp_group = dycp_coord.cpu_group
-            logger.info(
-                "[DYCP] Built dycp_group on dp_rank=%d: subgroups=%s "
-                "(this rank in subgroup %s, cp_rank=%d)",
-                dp_rank, dycp_subgroups, dycp_coord.ranks,
-                dp_rank % dycp_size,
-            )
         else:
             self.dycp_group = None
-            logger.info(
-                "[DYCP] dycp_group disabled on dp_rank=%d (dycp_size<=1)",
-                dp_rank,
-            )
 
     def shutdown(self):
         super().shutdown()
@@ -1845,9 +1835,9 @@ class DPEngineCoreProc(EngineCoreProc):
             ):
                 self.current_wave = new_wave
                 if not self.engines_running:
-                    logger.debug(
-                        "EngineCore starting idle loop for wave %d.",
-                        new_wave,
+                    logger.info(
+                        "EngineCore starting idle loop for wave %d (dp_rank=%s).",
+                        new_wave, getattr(self, "dp_rank", -1),
                     )
                     self.engines_running = True
         else:
@@ -1898,21 +1888,30 @@ class DPEngineCoreProc(EngineCoreProc):
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
-            # [DyCP] 根因修复(v79): bl_skip(all idle 分支, continue)在 DyCP 模式下禁用。
-            # 根因: bl_skip 走 continue 既不 increment step_counter, 又跳过
-            # _has_global_unfinished_reqs 里的 sync_dp_state(全 DP all_reduce)。
-            # 当某子组(如 sub1)本拍 had_reqs=True 正常执行并 inc step_counter、走
-            # sync_dp_state, 而另一子组(如 sub0)本拍 had_reqs=False 走 bl_skip 时:
-            #   1) sub0 step_counter 不增量 -> 与 sub1 step_counter 错位累积;
-            #   2) sub0 缺席全 DP sync_dp_state all_reduce -> collective 不配对 ->
-            #      collective-type-mismatch 死锁(sub1 stepcnt 先到 32 单边触发、sub0
-            #      缺席, v79 实测 sub1 比 sub0 早 2 拍到 32, 卡死 4 分钟)。
-            # DyCP 要 lockstep(每拍全 DP 同步步进), bl_skip 破坏它。禁用后 DyCP idle
-            # 本拍走向: 不 bl_skip -> 进 dycp_enabled 分支(空拍, 不补 dummy) ->
-            # _has_global_unfinished_reqs(inc step_counter + 每32拍 sync_dp_state) ->
-            # sync 返回全 DP 是否真 idle -> 真 idle 则停循环 + reset step_counter。
-            # 非 DyCP 维持原 bl_skip 逻辑不变(条件分支隔离, 不影响原有特性)。
             dycp_enabled = getattr(self, "dycp_group", None) is not None
+            # [DyCP] 方案B(修正): 判断本拍 0-token 步是否已在 worker 侧发过一次 metadata
+            # all_reduce。worker.execute_model 的 cadence dummy 守卫为:
+            #   total_num_scheduled_tokens==0 且 dp_size>1 且 (dycp_size>1 或 is_kv_consumer)
+            #   且 backend != external_launcher;
+            # external_launcher 时 model_runner_v1 自带 0-token 短路 dummy 也会发一次 AR。
+            # 下方 _zero_ar_zero_token_step 仅在 dycp_enabled=False(dycp_group 为 None, 即
+            # dycp_size<=1) 的 else 分支内使用, 该前提已排除 dycp_size>1, 故化简为:
+            #   0-token 拍发过 AR  <=>  is_kv_consumer 或 backend==external_launcher;
+            # 反之 "0 次 AR 的 0-token 拍" 即生产者且非 external_launcher, 需跳过 step_counter
+            # 以跟踪 AR 计数(见下方 elif 分支); "1 次 AR 的 0-token 拍" 须保留 baseline 增
+            # step_counter 对齐(见下方 else 分支)。
+            _is_kv_consumer = (
+                self.vllm_config.kv_transfer_config is not None
+                and self.vllm_config.kv_transfer_config.is_kv_consumer
+            )
+            _is_external_launcher = (
+                self.vllm_config.parallel_config.distributed_executor_backend
+                == "external_launcher"
+            )
+            _zero_ar_zero_token_step = (
+                not _is_kv_consumer and not _is_external_launcher
+            )
+            _skip_global_ar_sync = False
             if not executed:
                 if (not local_unfinished_reqs and not self.engines_running
                         and not dycp_enabled):
@@ -1934,11 +1933,55 @@ class DPEngineCoreProc(EngineCoreProc):
                     pass  # DyCP: 0-token/空拍已由 DUMMY-A 发 AR, 不补 execute_dummy_batch
                 elif not had_reqs:
                     self.execute_dummy_batch()
+                elif _zero_ar_zero_token_step:
+                    # [DyCP] 方案B(修正, 生产者专属): 0-token finish / WAITING_FOR_REMOTE_KV
+                    # 拍(had_reqs=True 但 executed=False), 且本端为生产者(is_kv_consumer=False)、
+                    # 非 external_launcher。此时 worker.execute_model 的 cadence dummy 守卫不触发
+                    # (守卫要求 dycp_size>1 或 is_kv_consumer; 此分支前提 dycp_enabled=False 即
+                    # dycp_size<=1, 且非 consumer、非 external_launcher), 故本拍在 worker 侧
+                    # **0 次** metadata all_reduce。但 baseline 仍调 _has_global_unfinished_reqs
+                    # 令 step_counter+=1 -> owner 的 step_counter 比 AR 计数多 1 -> 墙钟窗口内 owner
+                    # 多走迭代、独自提前撞 %32 边界单边进 sync_dp_state, 而空转 DP 还在发 metadata AR
+                    # -> 同一 dp_group 上 collective-type 不配对死锁(v2 探针坐实: P 端 owner
+                    # step_counter=32 单边进 sync32, 空转 DP=30; P 端 cadence_dummy=0)。
+                    # 修复: 此拍跳过 _has_global_unfinished_reqs(不增 step_counter、不触发
+                    # sync_dp_state 的全 DP all_reduce), 使 owner 的 step_counter 严格跟踪 AR 计数
+                    # (与空转 DP 1:1 对齐), 消除"领先撞 %32"的漂移源。安全前提: 此拍 req 仍在跑
+                    # (had_reqs=True 且 local_unfinished 多半为 True, engines_running 保持 True 不会
+                    # 被误判暂停); 下一拍 dummy_batch/run_real 仍会正常调 _has_global_unfinished_reqs。
+                    _skip_global_ar_sync = True
+                else:
+                    # [DyCP] 方案B(修正, 消费者/external_launcher 保留 baseline): 此拍为"1 次 AR 的
+                    # 0-token 拍"(消费者 is_kv_consumer=True, 或 backend==external_launcher)。
+                    # worker.execute_model 的 cadence dummy 守卫对 consumer 触发(或 external_launcher
+                    # 的 model_runner_v1 自带 0-token 短路 dummy), 本拍在 worker 侧**已发 1 次**
+                    # metadata all_reduce。故必须保留 baseline: 照常调 _has_global_unfinished_reqs
+                    # 令 step_counter+=1, 使 step_counter 与 AR 计数 1:1 对齐。若误跳过(如此前过宽
+                    # 门控), 会令 step_counter 落后 AR 计数 -> 同样在 %32 边界产生 collective-type
+                    # 不配对死锁(v2 证据: D 端 consumer 42 次 cadence_dummy guard_kv_consumer=True,
+                    # baseline 增 step_counter 对齐时 req#1 正常; 误跳过则 D 端几乎立即死锁)。
+                    # 此处不做任何额外动作, 让流程落入 #3) 正常调
+                    # _has_global_unfinished_reqs。
+                    pass
+
 
             # 3) All-reduce operation to determine global unfinished reqs.
-            self.engines_running = self._has_global_unfinished_reqs(
-                local_unfinished_reqs
-            )
+            # [DyCP] 方案B: skip_no_dummy 拍跳过 _has_global_unfinished_reqs(不增
+            # step_counter、不触发 sync_dp_state 的全 DP all_reduce), 维持 owner 与
+            # 空转 DP 的 step_counter 锁步(见上方修复注释)。_skip_global_ar_sync 初始化
+            # 为 False, 仅当本拍走了生产者专属 skip 分支(_zero_ar_zero_token_step, 0 次 AR
+            # 的 0-token 拍)才置 True; 其余分支(run_real/dummy_batch/bl_skip/dycp_no_extra/
+            # keep_stepcnt_ar_aligned) 均不置, 仍照常调 _has_global_unfinished_reqs。
+            if _skip_global_ar_sync:
+                # 不调用 _has_global_unfinished_reqs, step_counter 与 engines_running 维持原值。
+                # 此分支仅在"0 次 AR 的 0-token 拍"(生产者、非 external_launcher)触发, 故 worker
+                # 侧本拍 **不发** metadata AR; 跳过 step_counter 增量正是为了与 AR 计数(0)对齐。
+                # 不执行任何操作(step_counter 与 engines_running 维持原值)。
+                pass
+            else:
+                self.engines_running = self._has_global_unfinished_reqs(
+                    local_unfinished_reqs
+                )
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
@@ -1967,6 +2010,7 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter += 1
         if self.step_counter % 32 != 0:
             return True
+
 
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
             self.dp_group,
