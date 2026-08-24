@@ -42,6 +42,12 @@ SCHEDULED = 2
 NOT_SCHEDULED = 1
 PREEMPTED = 0
 
+# all_gather_object 载荷中的保留键: 本端本拍实际调度到的每个 CP 长请求的 token 范围,
+# value=[num_scheduled_tokens, num_computed_tokens](均为 advance 后值, 范围定义
+# [num_computed - num_scheduled, num_computed))。与 __scheduled_cp__ 并列, 在收集
+# req_id 并集、本地/接收探针、状态 MIN 合并处一律跳过此两个保留键, 不当作 req_id。
+_RESERVED_TOKEN_RANGES_KEY = "__token_ranges__"
+
 
 class CPSyncProtocol:
     """Post-schedule consensus protocol for CP request scheduling.
@@ -84,7 +90,8 @@ class CPSyncProtocol:
         active_ids: list[str],
         status: list[int],
         local_scheduled_cp: int,
-    ) -> tuple[list[str], list[str], list[str], int]:
+        token_ranges: dict[str, tuple[int, int]],
+    ) -> tuple[list[str], list[str], list[str], int, dict[str, int]]:
         """Post-schedule consensus using all_gather_object by req_id, 合并阶段2协商.
 
         用子组内一次 gloo all_gather_object 交换 {req_id: status} 字典, 按 req_id
@@ -107,6 +114,12 @@ class CPSyncProtocol:
                                 注意是"本步是否调度到", 非"是否持有"——active 有但本步
                                 未调度到=0。写入保留键 __scheduled_cp__, all_gather 后
                                 取全子组 MIN 即 subgroup_all_schedule_cp_request。
+            token_ranges: req_id -> (num_scheduled_tokens, num_computed_tokens), 仅含
+                          本端本拍实际调度到(出现在 output.num_scheduled_tokens)的 CP 长
+                          请求。num_computed_tokens 为 advance 后值(理由见下方不变量)。
+                          写入保留键 __token_ranges__, 仅取证(探针打印各端 token 范围),
+                          不影响三态合并/回滚/降级决策。本拍无实际计算(finished-report-
+                          SCHEDULED 等)的请求不进此 dict, 范围留空。
 
         Returns:
             (confirmed_ids, soft_rollback_ids, hard_rollback_ids,
@@ -120,17 +133,42 @@ class CPSyncProtocol:
         合并时一律按 NOT_SCHEDULED 取("本端没排到它"), 不误判成 PREEMPTED(仅显式投
         PREEMPTED 才算 hard_rollback 危险值)。故 add 异步到达时一端 SCHEDULED / 另一端
         没到 -> MIN=NOT_SCHEDULED -> soft_rollback, 与"peer 没排到它"语义一致。
+
+        token 范围取样点不变量(关键): 本方法在 CPAwareScheduler.schedule() 中于
+        output = super().schedule() 返回后调用, 而 base 的 _update_after_schedule
+        (request.num_computed_tokens += num_scheduled_token) 已在 super() 内部 return
+        前执行, 故此处各 req 的 num_computed_tokens 已是 advance 后值 = comp_before +
+        sched。因此本拍真正计算的 token 范围 = [num_computed - num_scheduled, num_computed)
+        (即 range_start = num_computed_tokens - num_scheduled_tokens, range_end =
+        num_computed_tokens)。禁止误用 [num_computed, num_computed + num_scheduled):
+        该式仅在 advance 之前(= comp_before)成立, 在本取样点会把范围整体平移一个 sched、
+        误报成下一步起点。__token_ranges__ 仅用于探针取证, 不参与决策。
         """
+        # 全程计时(探针): t_start 整个共识起点; 三段时长 = gather / local / total。
+
+
         # 构造本端要发出的 dict: __scheduled_cp__ 是保留键(代替旧槽位机制的标志槽),
         # 表示本 rank 本步是否调度到长请求(1/0); 其余 key=req_id, value=该 req 本端状态。
         local_status_dict: dict = {"__scheduled_cp__": local_scheduled_cp}
         for i, req_id in enumerate(active_ids):
             local_status_dict[req_id] = status[i]
 
-        # 子组内一次 gloo all_gather_object。返回 gathered_objects[src_cp_rank] =
-        # 子组内 cp_rank=src 的端发来的 dict, 长度恒=子组端数(dycp_size, 可 >2);
-        # 各段天然按 cp_rank 区分来源。空拍端 dict={"__scheduled_cp__":0} 仍参与
-        # gather(旧机制空拍不进共识致忙端 hang 的根因已由此根治), 形状不对齐安全。
+        # 保留键 __token_ranges__: 携带本端本拍实际调度到的每个 CP 长请求的 token
+        # 范围, value=[num_scheduled_tokens, num_computed_tokens](均为 advance 后值,
+        # 范围 [num_computed - num_scheduled, num_computed) 见方法 docstring 不变量)。
+        # 各 rank 都写该键(无调度 CP 时为空 dict)以保证保留键集合一致; 收集 req_id
+        # 并集、本地/接收探针、状态 MIN 合并处一律跳过 __scheduled_cp__ 与
+        # __token_ranges__ 两个保留键, 不当作 req_id 处理。
+        token_ranges_payload: dict[str, list[int]] = {}
+        for req_id, range_value in token_ranges.items():
+            num_scheduled_tokens_payload = range_value[0]
+            num_computed_tokens_payload = range_value[1]
+            token_ranges_payload[req_id] = [
+                int(num_scheduled_tokens_payload),
+                int(num_computed_tokens_payload),
+            ]
+        local_status_dict[_RESERVED_TOKEN_RANGES_KEY] = token_ranges_payload
+
         gathered_objects: list[dict] = [
             {} for _ in range(self.cp_world_size)
         ]
@@ -138,8 +176,6 @@ class CPSyncProtocol:
             gathered_objects, local_status_dict, group=self.dycp_group,
         )
 
-        # 子组所有端 scheduled_cp 的 MIN -> subgroup_all_schedule_cp_request。
-        # 普通循环取 min, 不用生成器表达式。
         subgroup_all_schedule_cp_request = SCHEDULED  # 初始为最大值, 下面循环取 min
         for src_rank in range(self.cp_world_size):
             value = int(gathered_objects[src_rank].get("__scheduled_cp__", 0))
@@ -151,8 +187,9 @@ class CPSyncProtocol:
         req_ids_union_set = set()
         for src_rank in range(self.cp_world_size):
             for key in gathered_objects[src_rank].keys():
-                if key != "__scheduled_cp__":
-                    req_ids_union_set.add(key)
+                if key in ("__scheduled_cp__", _RESERVED_TOKEN_RANGES_KEY):
+                    continue
+                req_ids_union_set.add(key)
         all_req_ids = sorted(req_ids_union_set)
 
         # 按 req_id 精确合并: 各端 status 取 MIN(缺 key -> NOT_SCHEDULED), 三态分类。
@@ -160,6 +197,13 @@ class CPSyncProtocol:
         confirmed: list[str] = []
         soft_rollback: list[str] = []
         hard_rollback: list[str] = []
+        # confirmed_token_alignment: req_id -> min_num_computed_tokens(各 rank advance
+        # 后 num_computed_tokens 的最小值, 即子组共识的 ENDoMin)。仅含 confirmed 且
+        # 对称(req 在子组每个 rank 的 __token_ranges__ 中都有条目, 各 rank 本拍都真
+        # 调度了它)的长请求。供 scheduler 端 _align_cp_token_range 把大端 ENDo 削到此处,
+        # 使各 rank 对同一 confirmed 长请求切同一 total, 消除 per-layer dycp all_gather
+        # 形状不配对的死锁根因。详见 _align_cp_token_range docstring。
+        confirmed_token_alignment: dict[str, int] = {}
         for req_id in all_req_ids:
             min_status = SCHEDULED  # 初始最大值, 下面循环取 min
             for src_rank in range(self.cp_world_size):
@@ -172,6 +216,55 @@ class CPSyncProtocol:
                 soft_rollback.append(req_id)
             else:
                 hard_rollback.append(req_id)
+            # ---- 对齐目标计算: 仅 confirmed 且对称(各 rank __token_ranges__ 都有)的 req ----
+            if min_status < SCHEDULED:
+                continue
+            # 收集各 rank 对该 req 的 token 范围(num_scheduled, num_computed), 仅取各 rank
+            # __token_ranges__ 中真有该 req 的(finished-report-SCHEDULED 的非对称端不在
+            # __token_ranges__, 跳出对称要求、不进对齐, 留给既有 finished/dummy 路径)。
+            per_rank_ends = []  # 各 rank 的 (range_start, num_computed_tokens) 列表
+            symmetric = True    # 子组每个 rank 的 __token_ranges__ 都有该 req
+            for src_rank in range(self.cp_world_size):
+                per_req_ranges = gathered_objects[src_rank].get(
+                    _RESERVED_TOKEN_RANGES_KEY, {}
+                )
+                entry = per_req_ranges.get(req_id)
+                if entry is None:
+                    symmetric = False
+                    break
+                num_scheduled_tokens_local = int(entry[0])
+                num_computed_tokens_local = int(entry[1])
+                range_start_local = (
+                    num_computed_tokens_local - num_scheduled_tokens_local
+                )
+                per_rank_ends.append(
+                    (range_start_local, num_computed_tokens_local)
+                )
+            if not symmetric or not per_rank_ends:
+                # 非对称: 某 rank finished-report-SCHEDULED 或本拍没真调度 -> 不对齐,
+                # 留给既有 finished/dummy 路径处理。注释明确 out-of-scope。
+                continue
+            # assert start 各 rank 一致: lockstep 不变量。confirmed 对称 req 的 start
+            # 由对称共识保证各 rank 相等(soft/hard/degrade 对称返回同一列表 -> comp_before
+            # 同步推进; 各 rank 都排到该 req 即各 rank comp_before 相同)。若 start 不一致
+            # 则锁步已破裂, 不在本计划处理范围 -> assert 报错暴露, 切勿静默。
+            first_range_start = per_rank_ends[0][0]
+            for (range_start_local, _) in per_rank_ends:
+                assert range_start_local == first_range_start, (
+                    "[DyCP align] confirmed req %s 各 rank range_start 不一致: "
+                    "%s (lockstep 破裂, 当前仅处理 start 一致情况, 见计划文档)"
+                    % (req_id, per_rank_ends)
+                )
+            # min_end = 各 rank num_computed_tokens(advance后) 的最小值。因 start 一致,
+            # 削 end 到 min_end 等价于削 count 到 min_count, 各 rank 对同一 total 切互补分片。
+            min_num_computed_tokens = min(
+                num_computed_tokens_local
+                for (_, num_computed_tokens_local) in per_rank_ends
+            )
+            confirmed_token_alignment[req_id] = min_num_computed_tokens
+
+
+        # local + gather = total 恒等(用派生式保证), 可自检对账。留工作区不提交。
 
         if soft_rollback or hard_rollback:
             logger.info(
@@ -183,7 +276,13 @@ class CPSyncProtocol:
                 self.cp_rank,
             )
 
-        return confirmed, soft_rollback, hard_rollback, subgroup_all_schedule_cp_request
+        return (
+            confirmed,
+            soft_rollback,
+            hard_rollback,
+            subgroup_all_schedule_cp_request,
+            confirmed_token_alignment,
+        )
     
 class CPAwareScheduler(Scheduler):
     """Scheduler with CP awareness for distributed DYCP.
@@ -454,6 +553,11 @@ class CPAwareScheduler(Scheduler):
         active_ids = sorted(self.active_cp_requests.keys())
         status: list[int] = []
         finished_ids: list[str] = []
+        # token_ranges: req_id -> (num_scheduled_tokens, num_computed_tokens)。仅含本端
+        # 本拍实际调度到的 CP 长请求(出现在 output.num_scheduled_tokens); finished-report
+        # SCHEDULED 的请求不在 output.num_scheduled_tokens, 不进此 dict(本拍无实际计算)。
+        # num_computed_tokens 取 advance 后值, 范围见 sync_schedule_confirm docstring 不变量。
+        token_ranges: dict[str, tuple[int, int]] = {}
         for req_id in active_ids:
             req = self.active_cp_requests[req_id]
             # [DyCP] 根因修复: CP 请求 finish 后必须退出 active_cp_requests,
@@ -475,6 +579,12 @@ class CPAwareScheduler(Scheduler):
             elif req_id in output.num_scheduled_tokens:
                 s = SCHEDULED
                 s_str = "SCHEDULED"
+                # token 范围取证(post-advance): 本拍真正计算区间
+                # [num_computed_tokens - num_scheduled_tokens, num_computed_tokens)。
+                token_ranges[req_id] = (
+                    int(output.num_scheduled_tokens[req_id]),
+                    int(req.num_computed_tokens),
+                )
             elif req_id in self._preempted_this_step:
                 s = PREEMPTED
                 s_str = "PREEMPTED"
@@ -489,8 +599,10 @@ class CPAwareScheduler(Scheduler):
             )
             status.append(s)
 
-        confirmed, soft_rollback_ids, hard_rollback_ids, subgroup_all_schedule_cp_request = (
-            self.cp_sync.sync_schedule_confirm(active_ids, status, local_scheduled_cp)
+        confirmed, soft_rollback_ids, hard_rollback_ids, subgroup_all_schedule_cp_request, confirmed_token_alignment = (
+            self.cp_sync.sync_schedule_confirm(
+                active_ids, status, local_scheduled_cp, token_ranges
+            )
         )
 
         # Clean up requests that finished on this rank before the sync.
@@ -521,8 +633,29 @@ class CPAwareScheduler(Scheduler):
         if hard_rollback_ids:
             output = self._hard_rollback(output, hard_rollback_ids)
 
+        # [DyCP token范围对齐] 共识后把 confirmed 长请求的 token 范围(END)削到子组 MIN,
+        # 使各 rank 对同一 confirmed 长请求切同一 total, 消除 per-layer dycp all_gather
+        # 形状不配对的死锁根因。仅处理 confirmed 对称 req(各 rank 均 SCHEDULED 且本拍都
+        # 真调度), 与 degrade/soft/hard 互斥(those 不作用于 confirmed req), 故插在其后
+        # 安全。详见 _align_cp_token_range docstring。执行顺序: degrade -> soft -> hard
+        # -> align -> _emit_pending_new_cp_as_new。
+        if confirmed_token_alignment:
+            self._align_cp_token_range(output, confirmed_token_alignment)
+
         self._preempted_this_step.clear()
 
+        # 侧是否对本拍 prefill 请求切 chunk。切 chunk 判据(worker mla_cp.py
+        # generate_dp_chunked_metadata): context_len = seq_lens - query_lens = 本拍
+        # 调度前已算的 tokens(advance 前的 num_computed_tokens); prefill 续算且
+        # context_len>0 时, 若 workspace 分摊后的 max_context_chunk<max_context_len 则
+        # num_chunks=cdiv(max_context_len,max_context_chunk)>1 即切 chunk。本处只取
+        # scheduler 侧能拿到的原生量(不反向依赖 worker 的 workspace 配置去预测确切
+        # num_chunks, 避免口径不一致误导); 真正切了与否的权威判定看 worker 侧
+        # context_len = req.num_computed_tokens(advance 后) - num_scheduled_tokens(本拍),
+        # 差即 advance 前已算(与 worker 同义)。此处在 align 后 emit 前, align 只削
+        # 本拍多算的(不动已算 comp_before), emit 还未撤回首调, 故该差值正确。
+        # prefill 续算判据: 0 < context_len < num_prompt_tokens(已算部分但未算完 prompt)。
+        # decode(context_len>=num_prompt_tokens) 与 首 prefill(context_len=0) 不触发 chunk。
         # output.cp_req_ids_sorted = sorted(confirmed) if confirmed else None
 
         # Signal workers to run a dummy forward for collective ops when this
@@ -650,6 +783,91 @@ class CPAwareScheduler(Scheduler):
 
         return output
     
+    def _align_cp_token_range(
+        self,
+        output: SchedulerOutput,
+        confirmed_token_alignment: dict[str, int],
+    ) -> None:
+        """共识后把 confirmed 长请求的 token 范围(END)削到子组 MIN, 对齐各 rank 切分 total。
+
+        触发: 某长请求在子组各 rank 均 SCHEDULED(confirmed), 但各 rank 本轮调度的
+        token 数(count / num_scheduled_tokens)因 budget/短请求负载不同而不一致。
+        worker 侧 PCPManager._get_local_cp_tokens 把该请求 total 在 cp_world_size
+        个 rank 间均分, 各 rank 对同一 total 切互补分片; per-layer dycp all_gather
+        要求各 rank 形状一致 -> 各 rank 必须对同一 CP 请求调度相同 count。count 不一致
+        则 total 不同 -> 切分不互补 -> per-layer all_gather 形状不配对 -> 层间错位死锁。
+        本方法把较大端的 ENDo 削到子组 min_end, 使各 rank 切同一 total, 根治此死锁。
+
+        仅处理 confirmed 且对称的请求(min==SCHEDULED 且子组每个 rank 的 __token_ranges__
+        都有该 req, 由 sync_schedule_confirm 的 confirmed_token_alignment 过滤保证)。
+        非对称(含 finished-report-SCHEDULED)不在本方法范围, 留给既有 finished/dummy 路径。
+
+        start 一致性: confirmed 对称 req 的 start(= num_computed_tokens -
+        num_scheduled_tokens, 两者 advance 后值)由对称共识保证各 rank 相等, sync 层已
+        assert 校验; 本方法据此把 ENDo 削到 min_end(等价削 count 到 min_count)。
+
+        语义(与 soft_rollback "留块+回退 advance" 同源, 但 req 仍留在 output 仅变小,
+        不像 soft/degrade 全量剔出):
+          - output.num_scheduled_tokens[req]: local_count -> min_count(= local_end - min_end)。
+          - output.total_num_scheduled_tokens: 扣减多算的 alignment_reduction_tokens。
+          - req.num_computed_tokens(advance 后 = local_end): 回退到 min_end(撤回 advance
+            多推部分, 保留之前拍真实进度; 与 soft_rollback 回退同源)。
+          - 不改 cp_rank_scheduled_tokens/cp_req_id/req_id_to_cp_size/num_cp_request:
+            req 仍是 CP 请求、仍在 output, 只是变小(区别 soft/degrade 把 req 整体剔出)。
+          - 不 kv_cache_manager.free: 本拍新分配尾部块未写入、下拍复用(留块原则),
+            FullAttentionManager get_num_blocks_to_allocate 钳 0, 无负分配/断言;
+            causal mask 只读 [start, start+min_count), 不脏读。
+          - 每请求数据(CachedRequestData/NewRequestData 的 num_computed_tokens = START,
+            advance 前值; count 由 num_scheduled_tokens 决定): START 字段不动、天然正确,
+            仅 count 经 num_scheduled_tokens 改动而正确。PP new_token_ids(async DyCP 下为
+            空)若非空则防御性截到 min_count。
+        """
+        for req_id, min_num_computed_tokens in confirmed_token_alignment.items():
+            # 仅当 req 仍在本次 output(未被 degrade/soft/hard 剔除)才对齐;
+            # 已被剔除的 req 不在 output.num_scheduled_tokens, 跳过。
+            if req_id not in output.num_scheduled_tokens:
+                continue
+            req = self.active_cp_requests.get(req_id)
+            if req is None or req_id not in self.requests:
+                # 应不发生(confirmed 对称 req 各 rank 都排到、未 finish); 防御性跳过。
+                continue
+            local_num_scheduled_tokens = int(output.num_scheduled_tokens[req_id])
+            local_num_computed_tokens = int(req.num_computed_tokens)
+            # 本端 ENDo(local_num_computed_tokens) 已是/低于子组 MIN -> 无需削减, no-op。
+            if local_num_computed_tokens <= min_num_computed_tokens:
+                continue
+            # 因 start 各 rank 一致(已 assert), reduction = local_end - min_end =
+            # local_count - min_count, 削 ENDo 到 min_end 即削 count 到 min_count。
+            alignment_reduction_tokens = (
+                local_num_computed_tokens - min_num_computed_tokens
+            )
+            aligned_num_scheduled_tokens = (
+                local_num_scheduled_tokens - alignment_reduction_tokens
+            )
+            # 1) output 侧 count: 削到 min_count。
+            output.num_scheduled_tokens[req_id] = aligned_num_scheduled_tokens
+            output.total_num_scheduled_tokens -= alignment_reduction_tokens
+            # 2) req 侧 num_computed_tokens(advance 后 = local_end): 回退到 min_end,
+            #    撤回 advance 多推部分, 保留之前拍真实进度。
+            req.num_computed_tokens = min_num_computed_tokens
+            # 3) PP new_token_ids 防御性截到 min_count(async DyCP 下该列表为空, no-op;
+            #    若未来关 async 则截断保证 PP 下发的 token 数与对齐后 count 一致)。
+            cached_reqs = output.scheduled_cached_reqs
+            if cached_reqs is not None and req_id in cached_reqs.req_ids:
+                cached_idx = cached_reqs.req_ids.index(req_id)
+                if (
+                    cached_reqs.new_token_ids
+                    and cached_idx < len(cached_reqs.new_token_ids)
+                    and len(cached_reqs.new_token_ids[cached_idx])
+                    > aligned_num_scheduled_tokens
+                ):
+                    cached_reqs.new_token_ids[cached_idx] = (
+                        cached_reqs.new_token_ids[cached_idx][
+                            :aligned_num_scheduled_tokens
+                        ]
+                    )
+            # 不动 cp 标志元数据; 不 free KV。探针记录对齐动作。
+
     def _remove_req_from_cached_only(
         self, output: SchedulerOutput, req_id: str
     ) -> None:
@@ -785,6 +1003,7 @@ class CPAwareScheduler(Scheduler):
                 continue
             self._rollback_cp_req_from_output(output, req_id)
             degraded_ids.append(req_id)
+            req = self.active_cp_requests.get(req_id)
         return len(degraded_ids) > 0
 
     # ------------------------------------------------------------------
@@ -833,6 +1052,8 @@ class CPAwareScheduler(Scheduler):
                 )
             else:
                 new_req_data = NewRequestData.from_request(req, block_ids)
+
+
             # [DyCP v85 修复] emit-as-NEW 必须用 "advance 前" 的 num_computed_tokens。
             # 本方法在 schedule() 末尾调用, 此时 base 的 _update_after_schedule 已把
             # req.num_computed_tokens += num_scheduled_tokens 这拍虚推。正常首调 NEW 在
