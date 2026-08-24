@@ -1119,8 +1119,22 @@ class EngineCoreProc(EngineCore):
             if data_parallel and vllm_config.kv_transfer_config is not None:
                 # modify the engine_id and append the local_dp_rank to it to ensure
                 # that the kv_transfer_config is unique for each DP rank.
+                # [DyCP] 对齐 domain 版做法: dycp 开启(dycp_size>1)时, 同一 dycp 子组内
+                # 全部 dp rank 共享同一个 transfer_engine_id(后缀用"子组索引"而非"单个rank")。
+                # 这样 D 侧按 [组engine_id][port] 存/读远端元数据时, port(handshake_port=
+                # kv_port+dp_rank)在组内全局唯一区分各 cp_rank, engine_id 跨 cp_rank 一致,
+                # 存/读天然对齐, 根治"P 端存到 peer 真实 engine_id、D 端按 owner engine_id 读
+                # 致 KeyError"的跨 engine_id 错配。子组索引 = local_dp_rank // dycp_size。
+                # 后缀名用 "subgroup"(子组索引)以示语义; 非 dycp(dycp_size==1)用原 "dp"
+                # (每 rank 独立), 含 pcp/普通 DP/D 端, 维持原行为零回归。
+                kv_transfer_engine_id_suffix = local_dp_rank
+                kv_transfer_engine_id_tag = "dp"
+                dycp_size = parallel_config.dycp_size
+                if dycp_size > 1:
+                    kv_transfer_engine_id_suffix = local_dp_rank // dycp_size
+                    kv_transfer_engine_id_tag = "subgroup"
                 vllm_config.kv_transfer_config.engine_id = (
-                    f"{vllm_config.kv_transfer_config.engine_id}_dp{local_dp_rank}"
+                    f"{vllm_config.kv_transfer_config.engine_id}_{kv_transfer_engine_id_tag}{kv_transfer_engine_id_suffix}"
                 )
                 logger.debug(
                     "Setting kv_transfer_config.engine_id to %s",
