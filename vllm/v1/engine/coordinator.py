@@ -280,6 +280,20 @@ class DPCoordinatorProc:
                         stats_changed = False
 
                     to_publish = (engine_req_counts_list, current_wave, engines_running)
+                    # [DyCP] Probe(A2): coordinator 心跳 publish 取证。idle 时 cur_wave 是否
+                    # 飙升; total_waiting 引擎侧≈0(↔ 193 不在引擎, 在前端回压)。
+                    try:
+                        _tot_wait = sum((c[0] if c else 0) for c in engine_req_counts_list)
+                        _tot_run = sum((c[1] if c else 0) for c in engine_req_counts_list)
+                        import logging as _pl
+                        _pl.getLogger("vllm.").info(
+                            "[DYCP] Probe/coord_pub cur_wave=%s engines_running=%s "
+                            "total_waiting=%s total_running=%s n_eng=%s",
+                            current_wave, engines_running, _tot_wait, _tot_run,
+                            len(engine_req_counts_list) if engine_req_counts_list else 0,
+                        )
+                    except Exception:
+                        pass
                     publish_front.send(msgspec.msgpack.encode(to_publish))
                     last_publish_time = int(time.time() * 1000)
                     continue
@@ -353,6 +367,17 @@ class DPCoordinatorProc:
                         # engines are paused, so that we can wake the other
                         # engines.
                         engine_to_exclude, wave = decoded
+                        # [DYCP] Probe/wake: coordinator 收到前端新请求(唤醒引擎)。
+                        try:
+                            logger.info(
+                                "[DYCP] Probe/wake-coord_recv engine_to_exclude=%s "
+                                "req_wave=%s cur_wave=%s engines_running=%s "
+                                "will_start_wave=%s",
+                                engine_to_exclude, wave, current_wave,
+                                engines_running, (not engines_running),
+                            )
+                        except Exception:
+                            pass
                         if not engines_running:
                             if wave < current_wave:
                                 # If the wave number is stale, ensure the message
@@ -417,11 +442,28 @@ class DPCoordinatorProc:
                             # (engines_running==False).
                             if current_wave <= wave:
                                 new_wave = wave + 1
-                                logger.debug(
-                                    "Moving DP wave from %d to %d.",
-                                    current_wave,
-                                    new_wave,
+                                # [DYCP] Probe/wake: coordinator 收到 rank0 的 wave_complete, 引擎暂停。
+                                logger.info(
+                                    "[DYCP] Probe/wake-coord_wave_complete old_wave=%s "
+                                    "new_wave=%s engines_running=%s->False eng_index=%s",
+                                    current_wave, new_wave, engines_running, eng_index,
                                 )
+                                # [DyCP] Probe(A2): wave_complete 时引擎侧 waiting 总数 +
+                                # 是否 idle 推进(racing): total_waiting==0 却仍在涨 wave =
+                                # idle 跑飞经 coordinator 反向传染。
+                                try:
+                                    _tw = sum(
+                                        (e.request_counts[0] if e.request_counts else 0)
+                                        for e in self.engines
+                                    )
+                                    import logging as _pl
+                                    _pl.getLogger("vllm.").info(
+                                        "[DYCP] Probe/coord_wave_complete_extra old_wave=%s "
+                                        "new_wave=%s total_waiting=%s racing=%s",
+                                        current_wave, new_wave, _tw, (_tw == 0),
+                                    )
+                                except Exception:
+                                    pass
                                 current_wave = new_wave
                                 engines_running = False
                                 wave_state_changed = True
@@ -432,10 +474,10 @@ class DPCoordinatorProc:
                             # 3. The engine received request for a non-current wave
                             # so we must ensure that other engines progress to the
                             # next wave (race condition handling).
-                            logger.debug(
-                                "Starting wave %d after notification of "
-                                "stale wave request from engine.",
-                                wave,
+                            logger.info(
+                                "[DYCP] Probe/wake-coord_start_wave_from_eng wave=%s "
+                                "eng_index=%s engines_running=%s->True",
+                                wave, eng_index, engines_running,
                             )
                             current_wave = wave
                             engines_running = True
@@ -455,6 +497,14 @@ class DPCoordinatorProc:
         has already received a request with this wave number and so doesn't
         require additional notification.
         """
+        # [DYCP] Probe/wake: coordinator 广播 START_DP_WAVE 唤醒引擎。
+        try:
+            logger.info(
+                "[DYCP] Probe/wake-coord_send_start_wave wave=%s exclude_engine_index=%s",
+                wave, exclude_engine_index,
+            )
+        except Exception:
+            pass
         wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))
         socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
 

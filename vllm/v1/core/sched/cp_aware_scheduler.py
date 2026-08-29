@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import time
 import torch
 import torch.distributed
 
@@ -47,6 +48,12 @@ PREEMPTED = 0
 # [num_computed - num_scheduled, num_computed))。与 __scheduled_cp__ 并列, 在收集
 # req_id 并集、本地/接收探针、状态 MIN 合并处一律跳过此两个保留键, 不当作 req_id。
 _RESERVED_TOKEN_RANGES_KEY = "__token_ranges__"
+
+# [DyCP/Probe] 保留键 __probe_sc__: 顺路携带本端 (step_counter, eng_iter_seq),
+# all_gather 后并排打印子组两 DP 拍数, 定位 wave 内 1 步错位起源拍。纯取证, 不参与
+# 任何决策; 所有 req_id 合并/决策循环沿用 __scheduled_cp__/__token_ranges__ 的跳过
+# 规则一并跳过本键(见下方 3 处 `if key in (...)` 与并集收集)。
+_RESERVED_PROBE_SC_KEY = "__probe_sc__"
 
 
 class CPSyncProtocol:
@@ -145,7 +152,14 @@ class CPSyncProtocol:
         误报成下一步起点。__token_ranges__ 仅用于探针取证, 不参与决策。
         """
         # 全程计时(探针): t_start 整个共识起点; 三段时长 = gather / local / total。
+        t_start = time.perf_counter()
 
+        # 三态到可读名的固定映射, 供所有探针共用, 避免日志里出现裸数字 magic number。
+        status_name_map = {
+            SCHEDULED: "SCHEDULED",
+            NOT_SCHEDULED: "NOT_SCHEDULED",
+            PREEMPTED: "PREEMPTED",
+        }
 
         # 构造本端要发出的 dict: __scheduled_cp__ 是保留键(代替旧槽位机制的标志槽),
         # 表示本 rank 本步是否调度到长请求(1/0); 其余 key=req_id, value=该 req 本端状态。
@@ -169,13 +183,79 @@ class CPSyncProtocol:
             ]
         local_status_dict[_RESERVED_TOKEN_RANGES_KEY] = token_ranges_payload
 
+        # [DyCP/Probe] 顺路携带本端 (step_counter, eng_iter_seq), 取证子组拍数对齐。
+        _probe_snap = getattr(self, "_probe_engcore_snapshot", None)
+        _probe_sc_val = (
+            (_probe_snap[0], _probe_snap[2]) if _probe_snap is not None else (-1, -1)
+        )
+        local_status_dict[_RESERVED_PROBE_SC_KEY] = _probe_sc_val
+
+        # [探针] 取证本端 all_gather 前发出的 local_status_dict, 留工作区不提交。
+        my_reqs_out = {}
+        for key, value in local_status_dict.items():
+            if key in ("__scheduled_cp__", _RESERVED_TOKEN_RANGES_KEY, _RESERVED_PROBE_SC_KEY):
+                continue
+            my_reqs_out[key] = status_name_map.get(int(value), str(value))
+        logger.info(
+            "[DYCP] Probe/ag_pre rank=%d scheduled_cp=%d active_n=%d out_dict={reqs=%s}",
+            self.cp_rank, local_scheduled_cp, len(my_reqs_out), my_reqs_out,
+        )
+
+        # 子组内一次 gloo all_gather_object。返回 gathered_objects[src_cp_rank] =
+        # 子组内 cp_rank=src 的端发来的 dict, 长度恒=子组端数(dycp_size, 可 >2);
+        # 各段天然按 cp_rank 区分来源。空拍端 dict={"__scheduled_cp__":0} 仍参与
+        # gather(旧机制空拍不进共识致忙端 hang 的根因已由此根治), 形状不对齐安全。
         gathered_objects: list[dict] = [
             {} for _ in range(self.cp_world_size)
         ]
+        t_before_gather = time.perf_counter()
         torch.distributed.all_gather_object(
             gathered_objects, local_status_dict, group=self.dycp_group,
         )
+        t_after_gather = time.perf_counter()
 
+        # [DyCP/Probe] 子组各 rank 的 step_counter 并排打印: 找 wave 内第一次两端拍数
+        # 差 1 的拍, 即 v108 死锁"1 步 phase 错位"的起源拍。复用本拍已完成的 all_gather,
+        # 零额外通信, 不改任何决策。
+        try:
+            import logging as _pl
+            _peer_parts = []
+            for _r in range(self.cp_world_size):
+                _pv = gathered_objects[_r].get(_RESERVED_PROBE_SC_KEY, (-1, -1))
+                _peer_parts.append("cpr%d=(sc=%s,ei=%s)" % (_r, _pv[0], _pv[1]))
+            _pl.getLogger("vllm.").info(
+                "[DYCP] Probe/subgrp_step_parity cp_rank=%s cur_wave=%s my_sc=%s "
+                "peers=[%s] active_ids=%s",
+                self.cp_rank,
+                _probe_snap[1] if _probe_snap is not None else -1,
+                _probe_sc_val[0], " ".join(_peer_parts), len(active_ids),
+            )
+        except Exception:
+            pass
+
+        # [探针] 取证收到的各端 all_gather 输出(每 src_cp_rank 段内容), 留工作区不提交。
+        # 可对照定位 add 异步到达时哪端缺 req / 各端 scheduled_cp 是否一致。
+        recv_segments = []
+        for src_rank in range(self.cp_world_size):
+            segment = gathered_objects[src_rank]
+            seg_reqs = {}
+            for key, value in segment.items():
+                # 跳过两个保留键: __scheduled_cp__ 由 seg_scheduled_cp 单独打印;
+                # __token_ranges__ value 是 dict 不是 int, 不能 int(), 否则崩。
+                if key in ("__scheduled_cp__", _RESERVED_TOKEN_RANGES_KEY, _RESERVED_PROBE_SC_KEY):
+                    continue
+                seg_reqs[key] = status_name_map.get(int(value), str(value))
+            seg_scheduled_cp = int(segment.get("__scheduled_cp__", -1))
+            recv_segments.append(
+                "src%d(sched_cp=%d, reqs=%s)" % (src_rank, seg_scheduled_cp, seg_reqs)
+            )
+        logger.info(
+            "[DYCP] Probe/ag_recv rank=%d n_src=%d recv=[%s]",
+            self.cp_rank, len(recv_segments), ", ".join(recv_segments),
+        )
+
+        # 子组所有端 scheduled_cp 的 MIN -> subgroup_all_schedule_cp_request。
+        # 普通循环取 min, 不用生成器表达式。
         subgroup_all_schedule_cp_request = SCHEDULED  # 初始为最大值, 下面循环取 min
         for src_rank in range(self.cp_world_size):
             value = int(gathered_objects[src_rank].get("__scheduled_cp__", 0))
@@ -187,16 +267,17 @@ class CPSyncProtocol:
         req_ids_union_set = set()
         for src_rank in range(self.cp_world_size):
             for key in gathered_objects[src_rank].keys():
-                if key in ("__scheduled_cp__", _RESERVED_TOKEN_RANGES_KEY):
+                if key in ("__scheduled_cp__", _RESERVED_TOKEN_RANGES_KEY, _RESERVED_PROBE_SC_KEY):
                     continue
                 req_ids_union_set.add(key)
         all_req_ids = sorted(req_ids_union_set)
 
         # 按 req_id 精确合并: 各端 status 取 MIN(缺 key -> NOT_SCHEDULED), 三态分类。
-        # 普通循环取 min, 不用生成器表达式; 不引入探针变量。
+        # 先算每个 req_id 的 min_status(主分类与下方 ag_merge 探针共用, 不重复计算)。
         confirmed: list[str] = []
         soft_rollback: list[str] = []
         hard_rollback: list[str] = []
+        min_status_per_req = {}  # req_id -> min_status, 主分类与 ag_merge 探针共用
         # confirmed_token_alignment: req_id -> min_num_computed_tokens(各 rank advance
         # 后 num_computed_tokens 的最小值, 即子组共识的 ENDoMin)。仅含 confirmed 且
         # 对称(req 在子组每个 rank 的 __token_ranges__ 中都有条目, 各 rank 本拍都真
@@ -210,6 +291,7 @@ class CPSyncProtocol:
                 value = int(gathered_objects[src_rank].get(req_id, NOT_SCHEDULED))
                 if value < min_status:
                     min_status = value
+            min_status_per_req[req_id] = min_status
             if min_status >= SCHEDULED:
                 confirmed.append(req_id)
             elif min_status >= NOT_SCHEDULED:
@@ -263,8 +345,71 @@ class CPSyncProtocol:
             )
             confirmed_token_alignment[req_id] = min_num_computed_tokens
 
+        # [探针] 取证按 req_id 合并后的决策结果, 留工作区不提交。
+        merge_rows = []
+        for req_id in all_req_ids:
+            min_status = min_status_per_req[req_id]
+            if min_status >= SCHEDULED:
+                decision = "confirmed"
+            elif min_status >= NOT_SCHEDULED:
+                decision = "soft"
+            else:
+                decision = "hard"
+            merge_rows.append(
+                (req_id, status_name_map.get(min_status, str(min_status)), decision)
+            )
+        logger.info(
+            "[DYCP] Probe/ag_merge rank=%d subgroup_all=%d union_n=%d merge=[%s]",
+            self.cp_rank, subgroup_all_schedule_cp_request, len(all_req_ids), merge_rows,
+        )
 
+        # [探针] 取证 all_gather 后每个长请求在各 src cp_rank 上的 token 范围, 便于跨
+        # rank 比对两端是否切同一 total。取样点在 advance 之后, 范围定义:
+        # range_start = num_computed_tokens - num_scheduled_tokens,
+        # range_end = num_computed_tokens(见方法 docstring 不变量)。某 rank 本拍未调度
+        # 该 req 则记 <none>。留工作区不提交。
+        range_rows = []
+        for req_id in all_req_ids:
+            per_src = []
+            for src_rank in range(self.cp_world_size):
+                segment = gathered_objects[src_rank]
+                per_req_ranges = segment.get(_RESERVED_TOKEN_RANGES_KEY, {})
+                entry = per_req_ranges.get(req_id)
+                if entry is None:
+                    per_src.append("src%d=<none>" % src_rank)
+                else:
+                    num_scheduled_tokens_recv = int(entry[0])
+                    num_computed_tokens_recv = int(entry[1])
+                    range_start = num_computed_tokens_recv - num_scheduled_tokens_recv
+                    range_end = num_computed_tokens_recv
+                    per_src.append(
+                        "src%d=range=[%d,%d) sched=%d comp=%d"
+                        % (
+                            src_rank,
+                            range_start,
+                            range_end,
+                            num_scheduled_tokens_recv,
+                            num_computed_tokens_recv,
+                        )
+                    )
+            range_rows.append((req_id, " | ".join(per_src)))
+        logger.info(
+            "[DYCP] Probe/ag_token_range rank=%d union_n=%d ranges=%s",
+            self.cp_rank, len(all_req_ids), range_rows,
+        )
+
+        # [探针] 三段计时(单位毫秒): all_gather 集合通信 / 整个共识 / 除集合通信外的本地耗时。
         # local + gather = total 恒等(用派生式保证), 可自检对账。留工作区不提交。
+        t_end = time.perf_counter()
+        all_gather_duration_ms = (t_after_gather - t_before_gather) * 1000.0
+        consensus_total_duration_ms = (t_end - t_start) * 1000.0
+        consensus_local_duration_ms = consensus_total_duration_ms - all_gather_duration_ms
+        logger.info(
+            "[DYCP] Probe/ag_time rank=%d cp_world_size=%d union_n=%d "
+            "all_gather_ms=%.3f consensus_total_ms=%.3f consensus_local_ms=%.3f",
+            self.cp_rank, self.cp_world_size, len(all_req_ids),
+            all_gather_duration_ms, consensus_total_duration_ms, consensus_local_duration_ms,
+        )
 
         if soft_rollback or hard_rollback:
             logger.info(
@@ -599,10 +744,23 @@ class CPAwareScheduler(Scheduler):
             )
             status.append(s)
 
+        # [DyCP/Probe] 把 EngineCore 暂存的拍数快照转交给 cp_sync, 供共识 all_gather 顺路携带。
+        if getattr(self, "cp_sync", None) is not None:
+            self.cp_sync._probe_engcore_snapshot = getattr(
+                self, "_probe_engcore_snapshot", None)
         confirmed, soft_rollback_ids, hard_rollback_ids, subgroup_all_schedule_cp_request, confirmed_token_alignment = (
             self.cp_sync.sync_schedule_confirm(
                 active_ids, status, local_scheduled_cp, token_ranges
             )
+        )
+        # [探针] 取证每拍共识与阶段2协商结果, 留工作区不提交。
+        logger.info(
+            "[DYCP] Probe/consensus rank=%d local_scheduled_cp=%d "
+            "subgroup_all_schedule_cp_request=%d num_confirmed=%d "
+            "soft=%d hard=%d active_ids=%s",
+            self.cp_rank, local_scheduled_cp, subgroup_all_schedule_cp_request,
+            len(confirmed), len(soft_rollback_ids), len(hard_rollback_ids),
+            active_ids,
         )
 
         # Clean up requests that finished on this rank before the sync.
@@ -644,6 +802,7 @@ class CPAwareScheduler(Scheduler):
 
         self._preempted_this_step.clear()
 
+        # [探针] 取证本拍各 prefill 续算请求的 context_len(已算部分), 用于判断 worker
         # 侧是否对本拍 prefill 请求切 chunk。切 chunk 判据(worker mla_cp.py
         # generate_dp_chunked_metadata): context_len = seq_lens - query_lens = 本拍
         # 调度前已算的 tokens(advance 前的 num_computed_tokens); prefill 续算且
@@ -651,11 +810,35 @@ class CPAwareScheduler(Scheduler):
         # num_chunks=cdiv(max_context_len,max_context_chunk)>1 即切 chunk。本处只取
         # scheduler 侧能拿到的原生量(不反向依赖 worker 的 workspace 配置去预测确切
         # num_chunks, 避免口径不一致误导); 真正切了与否的权威判定看 worker 侧
+        # Probe/chunk_split / Probe/cp_chunk_split。
         # context_len = req.num_computed_tokens(advance 后) - num_scheduled_tokens(本拍),
         # 差即 advance 前已算(与 worker 同义)。此处在 align 后 emit 前, align 只削
         # 本拍多算的(不动已算 comp_before), emit 还未撤回首调, 故该差值正确。
         # prefill 续算判据: 0 < context_len < num_prompt_tokens(已算部分但未算完 prompt)。
         # decode(context_len>=num_prompt_tokens) 与 首 prefill(context_len=0) 不触发 chunk。
+        for req_id_probe, num_scheduled_tokens_probe in output.num_scheduled_tokens.items():
+            req_probe = self.active_cp_requests.get(req_id_probe)
+            if req_probe is None:
+                req_probe = self.requests.get(req_id_probe)
+            if req_probe is None:
+                continue
+            num_computed_tokens_probe = int(req_probe.num_computed_tokens)
+            num_scheduled_tokens_probe = int(num_scheduled_tokens_probe)
+            context_len_probe = num_computed_tokens_probe - num_scheduled_tokens_probe
+            num_prompt_tokens_probe = int(req_probe.num_prompt_tokens)
+            is_cp_request_probe = req_id_probe in self.active_cp_requests
+            # 仅 prefill 续算(context_len 在 (0, num_prompt_tokens) 开区间)可能触发 chunk。
+            if 0 < context_len_probe < num_prompt_tokens_probe:
+                logger.info(
+                    "[DYCP] Probe/scheduler_chunk_predict req=%s is_cp=%s "
+                    "context_len=%d num_scheduled_tokens=%d num_prompt_tokens=%d "
+                    "num_computed_tokens=%s (prefill 续算, 可能触发 worker 切 chunk; "
+                    "权威判定看 worker Probe/chunk_split)",
+                    req_id_probe, is_cp_request_probe,
+                    context_len_probe, num_scheduled_tokens_probe,
+                    num_prompt_tokens_probe, num_computed_tokens_probe,
+                )
+
         # output.cp_req_ids_sorted = sorted(confirmed) if confirmed else None
 
         # Signal workers to run a dummy forward for collective ops when this
@@ -835,6 +1018,12 @@ class CPAwareScheduler(Scheduler):
             local_num_computed_tokens = int(req.num_computed_tokens)
             # 本端 ENDo(local_num_computed_tokens) 已是/低于子组 MIN -> 无需削减, no-op。
             if local_num_computed_tokens <= min_num_computed_tokens:
+                logger.info(
+                    "[DYCP] Probe/align_range rank=%d req=%s local_end=%d "
+                    "min_end=%d reduction=0 (本端已是不需削减)",
+                    self.cp_rank, req_id,
+                    local_num_computed_tokens, min_num_computed_tokens,
+                )
                 continue
             # 因 start 各 rank 一致(已 assert), reduction = local_end - min_end =
             # local_count - min_count, 削 ENDo 到 min_end 即削 count 到 min_count。
@@ -867,7 +1056,14 @@ class CPAwareScheduler(Scheduler):
                         ]
                     )
             # 不动 cp 标志元数据; 不 free KV。探针记录对齐动作。
-
+            logger.info(
+                "[DYCP] Probe/align_range rank=%d req=%s local_end=%d min_end=%d "
+                "reduction=%d -> count %d->%d (start 一致条件下 ENDo 削到子组 MIN)",
+                self.cp_rank, req_id,
+                local_num_computed_tokens, min_num_computed_tokens,
+                alignment_reduction_tokens,
+                local_num_scheduled_tokens, aligned_num_scheduled_tokens,
+            )
     def _remove_req_from_cached_only(
         self, output: SchedulerOutput, req_id: str
     ) -> None:
@@ -1003,7 +1199,19 @@ class CPAwareScheduler(Scheduler):
                 continue
             self._rollback_cp_req_from_output(output, req_id)
             degraded_ids.append(req_id)
+            # [探针] 取证降级明细, 留工作区不提交。
             req = self.active_cp_requests.get(req_id)
+            logger.info(
+                "[DYCP] Probe/degrade rank=%d req=%s degraded(CP batch soft-rollback)",
+                self.cp_rank, req_id,
+            )
+        # [探针] 取证降级汇总, 留工作区不提交。
+        logger.info(
+            "[DYCP] Probe/degrade_summary rank=%d degraded_ids=%s "
+            "post_num_cp=%s post_total=%s",
+            self.cp_rank, degraded_ids,
+            output.num_cp_request, output.total_num_scheduled_tokens,
+        )
         return len(degraded_ids) > 0
 
     # ------------------------------------------------------------------
@@ -1075,6 +1283,16 @@ class CPAwareScheduler(Scheduler):
             req.num_computed_tokens = num_computed_tokens_before_advance
             output.scheduled_new_reqs.append(new_req_data)
             self._cp_reqs_pending_new_emit.discard(req_id)
+            # [探针] 取证首调回滚后以 new 发出, 留工作区不提交。
+            logger.info(
+                "[DYCP] Probe/pending_new_emit rank=%d req=%s cached->new "
+                "(first-schedule rollback emit) "
+                "num_computed_tokens_before_advance=%d "
+                "num_scheduled_tokens_this_step=%d",
+                self.cp_rank, req_id,
+                num_computed_tokens_before_advance,
+                num_scheduled_tokens_this_step,
+            )
 
     # ------------------------------------------------------------------
     # Update from output: handle CP request completion
