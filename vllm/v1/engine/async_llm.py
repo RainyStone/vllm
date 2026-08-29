@@ -296,24 +296,6 @@ class AsyncLLM(EngineClient):
         reasoning_parser_kwargs: dict[str, Any] | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
-        # [DyCP] Probe(A3): 前端到达计数。统计 http/LLMEngine 收到的请求数, 与
-        # core_client 的 wake-add(实际派发到引擎的 add_request_async 数)对照, 定位
-        # ~193 回压在前端(到达≈200 vs 派发≈7)。仅 DP 协调(client 具有 current_wave)
-        # 时启用; 普通(非 DP/非协调)实例不打, 不干扰基线。
-        _try_ec = getattr(self, "engine_core", None)
-        if _try_ec is not None and getattr(_try_ec, "current_wave", None) is not None:
-            try:
-                self._probe_arrival_n = getattr(self, "_probe_arrival_n", 0) + 1
-                import logging as _pl
-                _pl.getLogger("vllm.").info(
-                    "[DYCP] Probe/frontend_arrival n=%s engines_running=%s "
-                    "current_wave=%s",
-                    self._probe_arrival_n,
-                    getattr(_try_ec, "engines_running", "?"),
-                    getattr(_try_ec, "current_wave", "?"),
-                )
-            except Exception:
-                pass
 
         if self.errored:
             raise EngineDeadError()
