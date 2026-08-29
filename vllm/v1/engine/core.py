@@ -1903,29 +1903,16 @@ class DPEngineCoreProc(EngineCoreProc):
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
             dycp_enabled = getattr(self, "dycp_group", None) is not None
-            # [DyCP] 方案B(修正): 判断本拍 0-token 步是否已在 worker 侧发过一次 metadata
-            # all_reduce。worker.execute_model 的 cadence dummy 守卫为:
-            #   total_num_scheduled_tokens==0 且 dp_size>1 且 (dycp_size>1 或 is_kv_consumer)
-            #   且 backend != external_launcher;
-            # external_launcher 时 model_runner_v1 自带 0-token 短路 dummy 也会发一次 AR。
-            # 下方 _zero_ar_zero_token_step 仅在 dycp_enabled=False(dycp_group 为 None, 即
-            # dycp_size<=1) 的 else 分支内使用, 该前提已排除 dycp_size>1, 故化简为:
-            #   0-token 拍发过 AR  <=>  is_kv_consumer 或 backend==external_launcher;
-            # 反之 "0 次 AR 的 0-token 拍" 即生产者且非 external_launcher, 需跳过 step_counter
-            # 以跟踪 AR 计数(见下方 elif 分支); "1 次 AR 的 0-token 拍" 须保留 baseline 增
-            # step_counter 对齐(见下方 else 分支)。
-            _is_kv_consumer = (
-                self.vllm_config.kv_transfer_config is not None
-                and self.vllm_config.kv_transfer_config.is_kv_consumer
-            )
-            _is_external_launcher = (
-                self.vllm_config.parallel_config.distributed_executor_backend
-                == "external_launcher"
-            )
-            _zero_ar_zero_token_step = (
-                not _is_kv_consumer and not _is_external_launcher
-            )
-            _skip_global_ar_sync = False
+            # [v127 ROOT FIX] Unconditional step_counter++ + blocking sync_dp_state —
+            # removes _skip_global_ar_sync (dev's commit 6da24b6ab) that broke
+            # step_counter lockstep across ranks (some ranks skip step++ →
+            # %32 sync_dp_state fires at different step → blocking all_reduce
+            # wedge: v2/v79/v116 root. Removing skip restores baseline lockstep
+            # for ALL ranks: every busy-loop iteration calls _has_global →
+            # step_counter++ → %32 blocking sync_dp_state → atomic wave_complete
+            # across all ranks. async scheduling (batch_queue/submit_earlyret)
+            # preserved — host blocks only at sync_dp_state (every 32 steps), not
+            # at every cad-AR. D node (dycp_size=1) uses same path → no wedge.
             if not executed:
                 if (not local_unfinished_reqs and not self.engines_running
                         and not dycp_enabled):
@@ -1936,66 +1923,15 @@ class DPEngineCoreProc(EngineCoreProc):
                 # idle rank keeping collective cadence). When execute_model
                 # already ran (had_reqs True), the per-step metadata all_reduce
                 # was already emitted -- skip the dummy (see comment above).
-                # [DyCP] 阶段1: DyCP 开启时(dycp_group 非空), step_with_batch_queue
-                # 每轮都 schedule 并提交一次 execute_model(含请求走真前向、无请求走
-                # 空 output 的 worker DUMMY-A), 故每轮已在 worker 侧发过一次 metadata
-                # all_reduce。此处不再补 execute_dummy_batch(同步阻塞, 无 future),
-                # 否则本拍双发 AR -> metadata AR 计数错位 -> 全 DP collective-type-
-                # mismatch 死锁。仅保留 engines_running=False 的 continue(全 DP idle
-                # 反馈, 见上方分支)。非 DyCP 路径维持原 if not had_reqs 补 dummy 逻辑不变。
                 if dycp_enabled:
                     pass  # DyCP: 0-token/空拍已由 DUMMY-A 发 AR, 不补 execute_dummy_batch
                 elif not had_reqs:
                     self.execute_dummy_batch()
-                elif _zero_ar_zero_token_step:
-                    # [DyCP] 方案B(修正, 生产者专属): 0-token finish / WAITING_FOR_REMOTE_KV
-                    # 拍(had_reqs=True 但 executed=False), 且本端为生产者(is_kv_consumer=False)、
-                    # 非 external_launcher。此时 worker.execute_model 的 cadence dummy 守卫不触发
-                    # (守卫要求 dycp_size>1 或 is_kv_consumer; 此分支前提 dycp_enabled=False 即
-                    # dycp_size<=1, 且非 consumer、非 external_launcher), 故本拍在 worker 侧
-                    # **0 次** metadata all_reduce。但 baseline 仍调 _has_global_unfinished_reqs
-                    # 令 step_counter+=1 -> owner 的 step_counter 比 AR 计数多 1 -> 墙钟窗口内 owner
-                    # 多走迭代、独自提前撞 %32 边界单边进 sync_dp_state, 而空转 DP 还在发 metadata AR
-                    # -> 同一 dp_group 上 collective-type 不配对死锁(v2 探针坐实: P 端 owner
-                    # step_counter=32 单边进 sync32, 空转 DP=30; P 端 cadence_dummy=0)。
-                    # 修复: 此拍跳过 _has_global_unfinished_reqs(不增 step_counter、不触发
-                    # sync_dp_state 的全 DP all_reduce), 使 owner 的 step_counter 严格跟踪 AR 计数
-                    # (与空转 DP 1:1 对齐), 消除"领先撞 %32"的漂移源。安全前提: 此拍 req 仍在跑
-                    # (had_reqs=True 且 local_unfinished 多半为 True, engines_running 保持 True 不会
-                    # 被误判暂停); 下一拍 dummy_batch/run_real 仍会正常调 _has_global_unfinished_reqs。
-                    _skip_global_ar_sync = True
-                else:
-                    # [DyCP] 方案B(修正, 消费者/external_launcher 保留 baseline): 此拍为"1 次 AR 的
-                    # 0-token 拍"(消费者 is_kv_consumer=True, 或 backend==external_launcher)。
-                    # worker.execute_model 的 cadence dummy 守卫对 consumer 触发(或 external_launcher
-                    # 的 model_runner_v1 自带 0-token 短路 dummy), 本拍在 worker 侧**已发 1 次**
-                    # metadata all_reduce。故必须保留 baseline: 照常调 _has_global_unfinished_reqs
-                    # 令 step_counter+=1, 使 step_counter 与 AR 计数 1:1 对齐。若误跳过(如此前过宽
-                    # 门控), 会令 step_counter 落后 AR 计数 -> 同样在 %32 边界产生 collective-type
-                    # 不配对死锁(v2 证据: D 端 consumer 42 次 cadence_dummy guard_kv_consumer=True,
-                    # baseline 增 step_counter 对齐时 req#1 正常; 误跳过则 D 端几乎立即死锁)。
-                    # 此处不做任何额外动作, 让流程落入 #3) 正常调
-                    # _has_global_unfinished_reqs。
-                    pass
-
 
             # 3) All-reduce operation to determine global unfinished reqs.
-            # [DyCP] 方案B: skip_no_dummy 拍跳过 _has_global_unfinished_reqs(不增
-            # step_counter、不触发 sync_dp_state 的全 DP all_reduce), 维持 owner 与
-            # 空转 DP 的 step_counter 锁步(见上方修复注释)。_skip_global_ar_sync 初始化
-            # 为 False, 仅当本拍走了生产者专属 skip 分支(_zero_ar_zero_token_step, 0 次 AR
-            # 的 0-token 拍)才置 True; 其余分支(run_real/dummy_batch/bl_skip/dycp_no_extra/
-            # keep_stepcnt_ar_aligned) 均不置, 仍照常调 _has_global_unfinished_reqs。
-            if _skip_global_ar_sync:
-                # 不调用 _has_global_unfinished_reqs, step_counter 与 engines_running 维持原值。
-                # 此分支仅在"0 次 AR 的 0-token 拍"(生产者、非 external_launcher)触发, 故 worker
-                # 侧本拍 **不发** metadata AR; 跳过 step_counter 增量正是为了与 AR 计数(0)对齐。
-                # 不执行任何操作(step_counter 与 engines_running 维持原值)。
-                pass
-            else:
-                self.engines_running = self._has_global_unfinished_reqs(
-                    local_unfinished_reqs
-                )
+            self.engines_running = self._has_global_unfinished_reqs(
+                local_unfinished_reqs
+            )
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
