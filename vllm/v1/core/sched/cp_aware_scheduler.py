@@ -169,6 +169,10 @@ class CPSyncProtocol:
             ]
         local_status_dict[_RESERVED_TOKEN_RANGES_KEY] = token_ranges_payload
 
+        # 子组内一次 gloo all_gather_object。返回 gathered_objects[src_cp_rank] =
+        # 子组内 cp_rank=src 的端发来的 dict, 长度恒=子组端数(dycp_size, 可 >2);
+        # 各段天然按 cp_rank 区分来源。空拍端 dict={"__scheduled_cp__":0} 仍参与
+        # gather(旧机制空拍不进共识致忙端 hang 的根因已由此根治), 形状不对齐安全。
         gathered_objects: list[dict] = [
             {} for _ in range(self.cp_world_size)
         ]
@@ -176,6 +180,8 @@ class CPSyncProtocol:
             gathered_objects, local_status_dict, group=self.dycp_group,
         )
 
+        # 子组所有端 scheduled_cp 的 MIN -> subgroup_all_schedule_cp_request。
+        # 普通循环取 min, 不用生成器表达式。
         subgroup_all_schedule_cp_request = SCHEDULED  # 初始为最大值, 下面循环取 min
         for src_rank in range(self.cp_world_size):
             value = int(gathered_objects[src_rank].get("__scheduled_cp__", 0))
